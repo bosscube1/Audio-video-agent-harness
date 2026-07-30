@@ -6,6 +6,18 @@ Talk to it by **typing** or **speaking**. It talks back.
 
 ---
 
+## Project Status
+
+This project is being rewritten as a **PySide6 desktop app** with:
+
+- audit logging,
+- policy gating,
+- and a timed **yolo** toggle.
+
+The current top-level files will remain until they are replaced or deleted in later phases.
+
+---
+
 ## Quick Start
 
 ### 1. Prerequisites
@@ -16,10 +28,23 @@ Talk to it by **typing** or **speaking**. It talks back.
 
 ### 2. Install Dependencies
 
+`requirements.txt` is a fully locked environment generated from `pyproject.toml`.
+To install the pinned runtime dependencies:
+
 ```bash
 cd gemini-live-agent
 pip install -r requirements.txt
 ```
+
+Or install the project directly (editable):
+
+```bash
+pip install -e .
+```
+
+Development dependencies are listed under `[project.optional-dependencies]` in `pyproject.toml` and can be installed with `pip install -e ".[dev]"`.
+
+For a fully pinned development environment, use `requirements-dev.lock.txt` (runtime + dev).
 
 ### 3. Set Your API Key
 
@@ -160,7 +185,7 @@ User ↔ [Text CLI / Microphone+Speaker]
     Local Tool Execution
       ├── read_file / write_file / list_directory / delete_file
       ├── run_command (async subprocess)
-      └── web_search (DuckDuckGo / googlesearch)
+      └── web_search (DuckDuckGo)
 ```
 
 ### Audio Specs
@@ -181,7 +206,7 @@ The app will automatically fall back to text-only mode. To use voice, ensure you
 Set the key as shown in the Quick Start section above.
 
 ### Session disconnects after ~10 minutes
-Context window compression is enabled by default, which should allow unlimited sessions. If you experience disconnects, try reducing the conversation length or restarting.
+Context-window compression removes the 15-minute audio-only and 2-minute audio+video session-length caps, but it does **not** remove the underlying WebSocket connection lifetime (~10 minutes). True long-lived sessions require resumption or reconnection, which is being implemented.
 
 ### Command timeout
 The default timeout for `run_command` is 30 seconds. The model can request a longer timeout via the `timeout` parameter.
@@ -192,6 +217,15 @@ The default timeout for `run_command` is 30 seconds. The model can request a lon
 
 ```
 gemini-live-agent/
+├── app/              # PySide6 desktop UI (new)
+├── audit/            # Audit logging (new)
+├── core/             # Agent core / orchestration (new)
+├── media/            # Audio/video capture and playback (new)
+├── obs/              # Observability / telemetry (new)
+├── persist/          # Session persistence / state storage (new)
+├── policy/           # Policy gating rules (new)
+├── settings/         # App settings and configuration (new)
+├── tools/            # Local tool implementations directory (new)
 ├── main.py           # Entry point & CLI argument parsing
 ├── agent.py          # Core agent loop (WebSocket, tool dispatch)
 ├── audio.py          # Microphone capture & speaker playback
@@ -202,6 +236,8 @@ gemini-live-agent/
 ├── requirements.txt  # Python dependencies
 └── README.md         # This file
 ```
+
+The new architecture directories will coexist with the current top-level files until those files are removed in later phases.
 
 ---
 

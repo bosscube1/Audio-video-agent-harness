@@ -10,16 +10,7 @@ Usage:
 
 import argparse
 import asyncio
-import os
 import sys
-
-# Force UTF-8 encoding and enable VT100 ANSI processing in Windows Command Prompt
-if sys.platform == "win32":
-    os.system("")
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from config import AVAILABLE_VOICES, DEFAULT_MODEL, DEFAULT_VOICE, AgentConfig
 

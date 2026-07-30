@@ -15,11 +15,6 @@ import inspect
 import sys
 from typing import Optional
 
-# Force UTF-8 output on Windows to avoid encoding errors with Rich
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-
 from google.genai import types
 from rich.box import ASCII
 from rich.console import Console
