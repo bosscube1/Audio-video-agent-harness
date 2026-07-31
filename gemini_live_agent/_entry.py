@@ -25,20 +25,20 @@ def _prepare_windows_console() -> None:
     _reconfigure_stream(sys.stderr)
 
 
-def run() -> None:
-    """Run the legacy CLI entry point."""
+def run() -> int:
+    """Run the CLI entry point and return its exit code."""
     if sys.platform == "win32":
         _prepare_windows_console()
 
     from main import main  # noqa: E402
 
-    main()
+    return main()
 
 
 def run_with_error_handling() -> None:
     """Run the CLI and print exceptions on failure."""
     try:
-        run()
+        sys.exit(run())
     except Exception:
         traceback.print_exc()
         sys.exit(1)

@@ -5,22 +5,26 @@ changes slowly compared to speech, so this captures at a low frame rate (1 fps
 by default) and downscales before encoding — full-resolution frames burn
 bandwidth and context for no gain in what the model can read.
 
-Capture runs on its own thread: `mss` is blocking and its instances are bound
+Capture runs on its own thread: ``mss`` is blocking and its instances are bound
 to the thread that created them, so it cannot share the default executor.
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import io
 import threading
 import time
-from typing import Optional
+from typing import Any
 
-from rich.console import Console
+from obs.logging_setup import get_logger
 
-console = Console()
+logger = get_logger(__name__)
 
-def _mss_factory(mss):
-    """Return the screenshotter class. mss 10 renamed `mss.mss` to `mss.MSS`."""
+
+def _mss_factory(mss: Any) -> Any:
+    """Return the screenshotter class. mss 10 renamed ``mss.mss`` to ``mss.MSS``."""
     return getattr(mss, "MSS", None) or mss.mss
 
 
@@ -48,9 +52,9 @@ class ScreenCapture:
         self.monitor = monitor
         self.max_width = max_width
         self.quality = quality
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=1)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
         self._running = False
 
     # -- Public API --
@@ -73,23 +77,31 @@ class ScreenCapture:
         self._running = True
         self._thread = threading.Thread(target=self._capture, daemon=True)
         self._thread.start()
-        console.print(
-            f"[dim green][SCREEN] Sharing monitor {self.monitor} "
-            f"({region['width']}x{region['height']}) at {self.fps:g} fps[/dim green]"
+        logger.info(
+            "[SCREEN] Sharing monitor %d (%dx%d) at %g fps",
+            self.monitor,
+            region["width"],
+            region["height"],
+            self.fps,
         )
 
     async def read_frame(self) -> bytes:
         """Return the next JPEG frame. Blocks until one is available."""
-        return await self._queue.get()
+        frame = await self._queue.get()
+        if frame is None:
+            raise asyncio.CancelledError("Screen capture stopped")
+        return frame
 
     async def stop(self) -> None:
         """Stop capturing."""
         if self._running:
             self._running = False
+            if self._loop is not None and not self._loop.is_closed():
+                self._loop.call_soon_threadsafe(self._enqueue_sentinel)
             if self._thread is not None:
                 self._thread.join(timeout=2)
                 self._thread = None
-            console.print("[dim][SCREEN] Screen sharing stopped[/dim]")
+            logger.info("[SCREEN] Screen sharing stopped")
 
     # -- Capture thread --
 
@@ -112,14 +124,14 @@ class ScreenCapture:
                     if image.width > self.max_width:
                         height = round(image.height * self.max_width / image.width)
                         image = image.resize(
-                            (self.max_width, height), Image.LANCZOS
+                            (self.max_width, height), Image.LANCZOS  # type: ignore[attr-defined]
                         )
 
                     buffer = io.BytesIO()
                     image.save(buffer, format="JPEG", quality=self.quality)
                     self._publish(buffer.getvalue())
-                except Exception as e:
-                    console.print(f"[dim red]Screen capture error: {e}[/dim red]")
+                except Exception as exc:
+                    logger.warning("Screen capture error: %s", exc)
 
                 # Pace to the target frame rate, accounting for capture time
                 elapsed = time.monotonic() - started
@@ -133,13 +145,18 @@ class ScreenCapture:
 
         def put() -> None:
             if self._queue.full():
-                try:
+                with contextlib.suppress(asyncio.QueueEmpty):
                     self._queue.get_nowait()  # drop the stale frame
-                except asyncio.QueueEmpty:
-                    pass
             self._queue.put_nowait(frame)
 
         try:
             self._loop.call_soon_threadsafe(put)
         except RuntimeError:
-            pass  # loop closed during shutdown
+            logger.debug("Failed to publish screen frame: event loop closed")
+
+    def _enqueue_sentinel(self) -> None:
+        """Put a sentinel to unblock read_frame during shutdown."""
+        if self._queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+        self._queue.put_nowait(None)
