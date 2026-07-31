@@ -6,6 +6,7 @@ No PySide6 here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 
 import tools._state as _state
@@ -14,6 +15,9 @@ from tools.registry import RunCommandArgs, ToolResult
 
 MAX_CMD_BYTES = 8 * 1024  # 8 KB
 MAX_TIMEOUT_SECONDS = 300
+
+_running_shells: dict[str, asyncio.subprocess.Process] = {}
+_running_shells_lock = asyncio.Lock()
 
 
 def _clamp_timeout(value: int | None) -> int:
@@ -28,7 +32,7 @@ def _truncate(text: str, limit: int) -> str:
     return text
 
 
-async def run_command(args: RunCommandArgs) -> ToolResult:
+async def run_command(args: RunCommandArgs, *, call_id: str = "") -> ToolResult:
     """Run a PowerShell command (Windows) or shell command (other platforms)."""
     decision = _state._policy.evaluate("run_command", args)
     if decision.is_denied():
@@ -67,6 +71,10 @@ async def run_command(args: RunCommandArgs) -> ToolResult:
                 cwd=cwd,
             )
 
+        if call_id:
+            async with _running_shells_lock:
+                _running_shells[call_id] = proc
+
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -78,6 +86,10 @@ async def run_command(args: RunCommandArgs) -> ToolResult:
                 False,
                 f"Error: Command timed out after {timeout}s.\nCommand: {args.command}",
             )
+        finally:
+            if call_id:
+                async with _running_shells_lock:
+                    _running_shells.pop(call_id, None)
 
         stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
         stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
@@ -95,3 +107,20 @@ async def run_command(args: RunCommandArgs) -> ToolResult:
         return ToolResult(True, "\n".join(parts) + f"\n{exit_info}")
     except OSError as exc:
         return ToolResult(False, f"Error executing command: {exc}")
+
+
+async def cancel_shell(call_id: str) -> bool:
+    """Kill a running shell process registered under ``call_id``.
+
+    Returns ``True`` if a process was found and killed. Safe to call multiple
+    times or with an unknown id.
+    """
+    async with _running_shells_lock:
+        proc = _running_shells.pop(call_id, None)
+
+    if proc is None:
+        return False
+
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+    return True

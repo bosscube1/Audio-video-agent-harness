@@ -107,6 +107,8 @@ class Journal:
         name: str,
         ok: bool,
         result: Any,
+        *,
+        orphaned: bool = False,
         epoch: int,
     ) -> None:
         """Log the outcome of a tool call after its side effect has run."""
@@ -117,6 +119,7 @@ class Journal:
                 "name": name,
                 "ok": ok,
                 "result": result,
+                "orphaned": orphaned,
                 "epoch": epoch,
             }
         )
@@ -131,13 +134,16 @@ class Journal:
             record["duration_minutes"] = duration_minutes
         self.write(record)
 
-    def connection_event(self, event: str, detail: str) -> None:
+    def connection_event(
+        self, event: str, detail: str, *, epoch: int = 0
+    ) -> None:
         """Log a connection lifecycle event (connect, disconnect, error, etc.)."""
         self.write(
             {
                 "type": "connection_event",
                 "event": event,
                 "detail": detail,
+                "epoch": epoch,
             }
         )
 

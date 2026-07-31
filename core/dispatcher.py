@@ -22,6 +22,7 @@ from core.events import (
     ToolCallReceived,
     ToolResultSent,
 )
+from persist.store import Store
 from policy import PolicyEngine, redact
 from policy.engine import DecisionKind
 from tools.registry import (
@@ -39,7 +40,7 @@ APPROVAL_TIMEOUT_SECONDS = 60.0
 _TOOL_TABLE: dict[
     str,
     tuple[
-        Callable[[Any], ToolResult] | Callable[[Any], Awaitable[ToolResult]],
+        Callable[..., ToolResult] | Callable[..., Awaitable[ToolResult]],
         type[ReadFileArgs | WriteFileArgs | ListDirectoryArgs | DeleteFileArgs | RunCommandArgs],
     ],
 ] = {
@@ -50,7 +51,7 @@ _TOOL_TABLE: dict[
     "run_command": (shell_tools.run_command, RunCommandArgs),
 }
 
-RespondCallback = Callable[[str, str, ToolResult], Awaitable[None]]
+RespondCallback = Callable[[str, str, ToolResult], Awaitable[bool]]
 
 
 class ToolDispatcher:
@@ -68,6 +69,8 @@ class ToolDispatcher:
         Run identifier forwarded to the journal.
     epoch:
         Resumption epoch forwarded to the journal.
+    store:
+        Optional SQLite store for completed tool-call results.
     """
 
     def __init__(
@@ -77,6 +80,7 @@ class ToolDispatcher:
         event_queue: asyncio.Queue[AgentEvent],
         run_id: str,
         epoch: int = 0,
+        store: Store | None = None,
     ) -> None:
         self._policy = policy
         self._journal = journal
@@ -84,10 +88,15 @@ class ToolDispatcher:
         self._run_id = run_id
         self._epoch = epoch
         self._respond: RespondCallback | None = None
+        self._store = store
+
+        # Original args per call id, retained for persistence and audit.
+        self._call_args: dict[str, dict[str, Any]] = {}
 
         # Pending user confirmations.
         self._approval_events: dict[str, asyncio.Event] = {}
         self._approval_results: dict[str, bool] = {}
+        self._approval_reasons: dict[str, str] = {}
 
         # Cancelled ids still in flight. Running file ops are allowed to finish,
         # but no FunctionResponse is sent for these ids.
@@ -101,6 +110,10 @@ class ToolDispatcher:
         """Forward a gating-mode change to the active policy engine."""
         self._policy.set_gating_mode(mode)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Update the resumption epoch for future journal/store records."""
+        self._epoch = epoch
+
     async def submit(self, call_id: str, name: str, args: dict[str, Any]) -> None:
         """Execute or queue a single tool call.
 
@@ -110,6 +123,7 @@ class ToolDispatcher:
         if self._consume_cancellation(call_id):
             return
 
+        self._call_args[call_id] = args
         self._journal.tool_attempt(call_id, name, args, epoch=self._epoch)
         await self._emit(ToolCallReceived(call_id=call_id, name=name, args=args))
 
@@ -152,13 +166,12 @@ class ToolDispatcher:
             if not approved:
                 if self._consume_cancellation(call_id):
                     return
-                reason = "approval_timeout"
-                if call_id in self._cancelled_ids:
-                    reason = "cancelled"
-                    self._cancelled_ids.discard(call_id)
-                elif call_id in self._approval_results:
-                    # Explicit deny from the user.
-                    reason = "user_denied"
+                reason = self._approval_reasons.pop(call_id, None)
+                if reason is None:
+                    reason = "approval_timeout"
+                    if call_id in self._cancelled_ids:
+                        reason = "cancelled"
+                        self._cancelled_ids.discard(call_id)
                 result = ToolResult(False, f"Tool not executed: {reason}")
                 await self._finish(call_id, name, result)
                 return
@@ -166,9 +179,9 @@ class ToolDispatcher:
         # Allowed or explicitly approved: execute the tool.
         try:
             if asyncio.iscoroutinefunction(func):
-                raw_result = await func(validated_args)
+                raw_result = await func(validated_args, call_id=call_id)
             else:
-                raw_result = await asyncio.to_thread(func, validated_args)
+                raw_result = await asyncio.to_thread(func, validated_args, call_id=call_id)
         except Exception as exc:  # pragma: no cover - defensive
             raw_result = ToolResult(False, f"Error executing {name}: {exc}")
 
@@ -186,15 +199,30 @@ class ToolDispatcher:
     def deny(self, call_id: str, reason: str = "user_denied") -> None:
         """Deny a pending tool call."""
         self._approval_results[call_id] = False
+        self._approval_reasons[call_id] = reason
         event = self._approval_events.pop(call_id, None)
         if event is not None:
             event.set()
+
+    def deny_all_pending(self, reason: str = "connection_lost") -> None:
+        """Deny every tool call currently awaiting user approval.
+
+        Each denied call follows the same flow as ``deny()`` and produces the
+        normal cancellation/result events through ``_finish()``.
+        """
+        for call_id in list(self._approval_events):
+            self.deny(call_id, reason=reason)
+            asyncio.create_task(
+                self._emit(
+                    ToolCallCancelled(call_ids=[call_id], reason=reason)
+                )
+            )
 
     def cancel(self, call_ids: list[str]) -> None:
         """Cancel the given tool call ids.
 
         Pending approvals are dropped immediately. Running shell processes are
-        not killed in Phase 2 (NotImplemented). Running file operations are
+        killed via ``tools.shell.cancel_shell``. Running file operations are
         allowed to finish, but no ``FunctionResponse`` is ever sent for a
         cancelled id.
         """
@@ -206,6 +234,7 @@ class ToolDispatcher:
                 event.set()
 
             self._cancelled_ids.add(call_id)
+            asyncio.create_task(shell_tools.cancel_shell(call_id))
             # Emit once, even if the id was not known to the dispatcher.
             asyncio.create_task(
                 self._emit(
@@ -230,12 +259,25 @@ class ToolDispatcher:
         return self._approval_results.pop(call_id, False)
 
     async def _finish(self, call_id: str, name: str, result: ToolResult) -> None:
-        """Journal, emit, and respond with a completed tool result."""
+        """Journal, emit, respond with, and persist a completed tool result."""
+        args = self._call_args.pop(call_id, None)
+        cancelled = self._consume_cancellation(call_id)
+
+        orphaned = True
+        respond = self._respond
+        if not cancelled and respond is not None:
+            try:
+                delivered = await respond(call_id, name, result)
+            except Exception:  # pragma: no cover - defensive
+                delivered = False
+            orphaned = not bool(delivered)
+
         self._journal.tool_result(
             call_id,
             name,
             result.ok,
             result.message,
+            orphaned=orphaned,
             epoch=self._epoch,
         )
         await self._emit(
@@ -244,15 +286,25 @@ class ToolDispatcher:
                 name=name,
                 ok=result.ok,
                 result=result.message,
+                orphaned=orphaned,
             )
         )
 
-        if self._consume_cancellation(call_id):
-            return
+        if self._store is not None and args is not None:
+            self._store.record_tool_call(
+                call_id=call_id,
+                run_id=self._run_id,
+                turn_id=None,
+                name=name,
+                args=args,
+                result=result.message,
+                ok=result.ok,
+                orphaned=orphaned,
+                epoch=self._epoch,
+            )
 
-        respond = self._respond
-        if respond is not None:
-            await respond(call_id, name, result)
+        if cancelled:
+            return
 
     def _consume_cancellation(self, call_id: str) -> bool:
         """Return True and remove the id if it has been cancelled."""

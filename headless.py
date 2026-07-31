@@ -1,6 +1,6 @@
 """Headless terminal driver for the Gemini Live Agent.
 
-Consumes the core event stream and drives ``LiveSession`` from the terminal.
+Consumes the core event stream and drives ``Supervisor`` from the terminal.
 No GUI dependencies; plain ``print`` output only.
 """
 
@@ -37,7 +37,7 @@ from core.events import (
     TurnComplete,
     UsageUpdate,
 )
-from core.session import LiveSession
+from core.supervisor import Supervisor
 from obs.logging_setup import get_run_id, setup_logging
 from persist.store import Store
 from settings.settings import AppSettings
@@ -202,7 +202,7 @@ async def _interactive_loop(
         return 1
 
     reason = session_task.result()
-    return 0 if reason.code != "error" else 1
+    return 0 if reason.code == "user_request" else 1
 
 
 async def run_headless(settings: AppSettings) -> int:
@@ -228,14 +228,13 @@ async def run_headless(settings: AppSettings) -> int:
         await command_queue.put(SetGatingMode(mode=GatingMode.YOLO))
 
     session_task = asyncio.create_task(
-        LiveSession(
+        Supervisor(
             settings=settings,
             command_queue=command_queue,
             event_queue=event_queue,
             journal=journal,
             store=store,
             run_id=run_id,
-            epoch=0,
         ).run()
     )
 

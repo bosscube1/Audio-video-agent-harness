@@ -161,7 +161,9 @@ class AppSettings(BaseSettings):
         effective.update(overrides)
         return cls(**effective)
 
-    def as_connect_config(self, tools: list[Any]) -> types.LiveConnectConfig:
+    def as_connect_config(
+        self, tools: list[Any], *, resumption_handle: str | None = None
+    ) -> types.LiveConnectConfig:
         """Build the LiveConnectConfig for a Gemini Live session."""
         os_info = f"{platform.system()} {platform.release()} ({platform.machine()})"
         shell = (
@@ -196,4 +198,5 @@ class AppSettings(BaseSettings):
             context_window_compression=types.ContextWindowCompressionConfig(
                 sliding_window=types.SlidingWindow(target_tokens=16000)
             ),
+            session_resumption=types.SessionResumptionConfig(handle=resumption_handle),
         )

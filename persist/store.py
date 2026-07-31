@@ -115,7 +115,14 @@ class Store:
             );
         """
         self._conn.executescript(schema)
+        self._ensure_column("tool_calls", "completed_at", "TEXT")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        """Add a column to a table if it does not already exist."""
+        columns = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         """Close the underlying database connection."""
@@ -190,12 +197,14 @@ class Store:
         epoch: int,
     ) -> None:
         """Persist a tool call and its result."""
+        completed_at = self._utc_now_iso() if result is not None else None
+        result_json = self._json.dumps(result) if result is not None else None
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO tool_calls
-                (id, run_id, turn_id, name, args, result, ok, orphaned, epoch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, run_id, turn_id, name, args, result, ok, orphaned, epoch, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     call_id,
@@ -203,10 +212,11 @@ class Store:
                     turn_id,
                     name,
                     self._json.dumps(args),
-                    self._json.dumps(result),
+                    result_json,
                     int(ok),
                     int(orphaned),
                     epoch,
+                    completed_at,
                 ),
             )
 
@@ -264,3 +274,72 @@ class Store:
         if row is None:
             return None
         return (row["handle"], row["created_at"], row["expires_at"])
+
+    def delete_expired_handles(self, now: datetime | None = None) -> None:
+        """Delete resumption handles whose ``expires_at`` has passed."""
+        when = now.isoformat() if now is not None else self._utc_now_iso()
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM resumption_handles WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (when,),
+            )
+
+    def get_active_resumption_handle(self, run_id: str, now: datetime | None = None) -> str | None:
+        """Return the most recent unexpired resumption handle for a run."""
+        self.delete_expired_handles(now)
+        when = now.isoformat() if now is not None else self._utc_now_iso()
+        row = self._conn.execute(
+            """
+            SELECT handle
+            FROM resumption_handles
+            WHERE run_id = ? AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (run_id, when),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["handle"])
+
+    def delete_resumption_handle(self, handle: str) -> None:
+        """Delete a specific resumption handle."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM resumption_handles WHERE handle = ?",
+                (handle,),
+            )
+
+    def get_turns(self, run_id: str, limit: int = 100) -> list[tuple[str, str, int]]:
+        """Return completed turns for a run ordered by completion time."""
+        rows = self._conn.execute(
+            """
+            SELECT role, text, epoch
+            FROM turns
+            WHERE run_id = ?
+            ORDER BY completed_at ASC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
+        return [(row["role"], row["text"], row["epoch"]) for row in rows]
+
+    def get_recent_tool_results(
+        self, run_id: str, limit: int = 100
+    ) -> list[tuple[str, str, bool, str, int]]:
+        """Return completed tool results for a run ordered by completion time."""
+        rows = self._conn.execute(
+            """
+            SELECT id, name, ok, result, epoch
+            FROM tool_calls
+            WHERE run_id = ? AND result IS NOT NULL
+            ORDER BY completed_at ASC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
+        return [
+            (row["id"], row["name"], bool(row["ok"]), row["result"], row["epoch"])
+            for row in rows
+        ]
+

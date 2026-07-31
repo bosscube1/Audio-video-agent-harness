@@ -20,9 +20,12 @@ class ConnectionState(StrEnum):
     IDLE = "idle"
     CONNECTING = "connecting"
     LIVE = "live"
+    DRAINING = "draining"
+    RECONNECTING = "reconnecting"
     DISCONNECTING = "disconnecting"
     DISCONNECTED = "disconnected"
     ERROR = "error"
+    FAILED = "failed"
 
 
 class TranscriptSource(StrEnum):
@@ -76,6 +79,7 @@ class ToolResultSent:
     name: str
     ok: bool
     result: str
+    orphaned: bool = False
     timestamp: datetime = field(default_factory=_utc_now)
 
 
@@ -83,6 +87,12 @@ class ToolResultSent:
 class ToolCallCancelled:
     call_ids: list[str]
     reason: str
+    timestamp: datetime = field(default_factory=_utc_now)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionExpiring:
+    seconds: int | None
     timestamp: datetime = field(default_factory=_utc_now)
 
 
@@ -148,6 +158,7 @@ AgentEvent = (
     | ToolCallCancelled
     | AudioLevel
     | SessionError
+    | SessionExpiring
     | ContextReset
     | UsageUpdate
 )

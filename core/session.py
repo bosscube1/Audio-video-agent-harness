@@ -1,18 +1,22 @@
-"""WebSocket session orchestration for the Gemini Live API.
+"""Single-epoch WebSocket driver for the Gemini Live API.
 
-A ``LiveSession`` owns a single Google Live API connection, the media send/receive
-loops, and the command dispatcher. It is intentionally a single-socket object;
-resumption and reconnect logic belong to Phase 3.
+A ``LiveSession`` owns one Google Live API connection, the media send/receive
+loops, and (optionally) a command dispatcher for that single epoch. It is
+intentionally a single-socket object; resumption and reconnect logic live in
+``core.supervisor.Supervisor``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import google.genai as genai
+import google.genai.errors
 from google.genai import types
 
 from audit.journal import Journal
@@ -36,6 +40,8 @@ from core.events import (
     ConnectionStateChanged,
     DisconnectReason,
     SessionError,
+    SessionExpiring,
+    TurnComplete,
     UsageUpdate,
 )
 from core.turn_state import TurnState
@@ -77,6 +83,29 @@ class LiveSession:
         Identifier for this run.
     epoch:
         Resumption epoch (always ``0`` in Phase 2).
+    resumption_handle:
+        Optional handle to request session resumption from the API.
+    mic:
+        Optional injected microphone. If provided, the session will not start or
+        stop it.
+    speaker:
+        Optional injected speaker. If provided, the session will not start or stop
+        it.
+    screen:
+        Optional injected screen capture. If provided, the session will not start or
+        stop it.
+    dispatcher:
+        Optional injected tool dispatcher. If provided, the session will not create
+        one and will not set its respond callback.
+    turn_state:
+        Optional injected turn state. If provided, the session will not create one.
+    on_resumption_handle:
+        Optional callback invoked when the server updates resumption availability.
+    on_connected:
+        Optional callback invoked after the session connects successfully.
+    respond_callback:
+        Optional callback used to send tool responses when a dispatcher is created
+        by the session.
     """
 
     def __init__(
@@ -88,6 +117,16 @@ class LiveSession:
         store: Store,
         run_id: str,
         epoch: int = 0,
+        *,
+        resumption_handle: str | None = None,
+        mic: Microphone | None = None,
+        speaker: Speaker | None = None,
+        screen: ScreenCapture | None = None,
+        dispatcher: ToolDispatcher | None = None,
+        turn_state: TurnState | None = None,
+        on_resumption_handle: Callable[[str, bool], Awaitable[None]] | None = None,
+        on_connected: Callable[[LiveSession], Awaitable[None]] | None = None,
+        respond_callback: Callable[[str, str, ToolResult], Awaitable[bool]] | None = None,
     ) -> None:
         self._settings = settings
         self._command_queue = command_queue
@@ -96,14 +135,30 @@ class LiveSession:
         self._store = store
         self._run_id = run_id
         self._epoch = epoch
+        self._resumption_handle = resumption_handle
 
-        self._turn_state = TurnState()
-        self._dispatcher: ToolDispatcher | None = None
+        self._turn_state = turn_state if turn_state is not None else TurnState()
+        self._dispatcher = dispatcher
 
-        self._mic: Microphone | None = None
-        self._speaker: Speaker | None = None
-        self._screen: ScreenCapture | None = None
+        self._mic = mic
+        self._speaker = speaker
+        self._screen = screen
 
+        self._on_resumption_handle = on_resumption_handle
+        self._on_connected = on_connected
+        self._respond_callback = respond_callback
+
+        self._owns_mic = mic is None
+        self._owns_speaker = speaker is None
+        self._owns_screen = screen is None
+        self._owns_dispatcher = dispatcher is None
+        self._owns_turn_state = turn_state is None
+
+        self._session: Any | None = None
+        self._latest_resumption_handle: str | None = None
+        self._closed = False
+
+        self._video_send_task: asyncio.Task[Any] | None = None
         self._shutdown_event = asyncio.Event()
         self._mic_gate_open = True
 
@@ -127,7 +182,8 @@ class LiveSession:
 
         client = genai.Client(api_key=api_key)
         connect_config = self._settings.as_connect_config(
-            tools=list(build_function_declarations())
+            tools=list(build_function_declarations()),
+            resumption_handle=self._resumption_handle,
         )
 
         await self._emit(ConnectionStateChanged(ConnectionState.CONNECTING))
@@ -137,48 +193,65 @@ class LiveSession:
                 model=self._settings.model,
                 config=connect_config,
             ) as session:
+                self._session = session
                 await self._emit(ConnectionStateChanged(ConnectionState.LIVE))
-                self._journal.connection_event("connected", self._settings.model)
+                self._journal.connection_event(
+                    "connected", self._settings.model, epoch=self._epoch
+                )
+                if self._on_connected is not None:
+                    await self._on_connected(self)
 
                 reason = await self._run_session(session, policy)
                 return reason
 
         except Exception as exc:
             logger.exception("Session failed")
+            reason = self._classify_disconnect(exc)
             await self._emit(
                 ConnectionStateChanged(
                     ConnectionState.ERROR,
-                    detail=str(exc),
+                    detail=reason.detail,
                 )
             )
-            return DisconnectReason("error", str(exc))
+            return reason
         finally:
             await self._emit(ConnectionStateChanged(ConnectionState.DISCONNECTED))
-            self._journal.connection_event("disconnected", "")
+            self._journal.connection_event("disconnected", "", epoch=self._epoch)
+            self._session = None
+            self._closed = True
 
     async def _run_session(
         self, session: Any, policy: PolicyEngine
     ) -> DisconnectReason:
         """Start media and the concurrent send/receive loops."""
-        self._dispatcher = ToolDispatcher(
-            policy=policy,
-            journal=self._journal,
-            event_queue=self._event_queue,
-            run_id=self._run_id,
-            epoch=self._epoch,
-        )
-        self._dispatcher.set_respond_callback(self._make_respond_callback(session))
+        if self._dispatcher is None:
+            self._dispatcher = ToolDispatcher(
+                policy=policy,
+                journal=self._journal,
+                event_queue=self._event_queue,
+                run_id=self._run_id,
+                epoch=self._epoch,
+                store=self._store,
+            )
+            respond_callback = self._respond_callback
+            if respond_callback is None:
+                respond_callback = self._make_respond_callback(session)
+            self._dispatcher.set_respond_callback(respond_callback)
 
         try:
-            if self._audio_output_available():
+            if self._audio_output_available() and self._speaker is None:
                 self._speaker = Speaker(device=self._settings.output_device)
                 await self._speaker.start()
 
-            if self._settings.mode != "text" and self._audio_input_available():
+            if (
+                self._settings.mode != "text"
+                and self._audio_input_available()
+                and self._mic is None
+            ):
                 self._mic = Microphone(device=self._settings.input_device)
                 await self._mic.start()
 
-            if self._settings.share_screen:
+            if self._settings.share_screen and self._screen is None:
                 self._screen = ScreenCapture(
                     fps=self._settings.screen_fps,
                     monitor=self._settings.screen_monitor,
@@ -207,13 +280,14 @@ class LiveSession:
                     )
                 )
             if self._screen is not None:
-                tasks.add(
-                    asyncio.create_task(
-                        self._video_send_loop(session, self._screen),
-                        name="video_send",
-                    )
+                self._video_send_task = asyncio.create_task(
+                    self._video_send_loop(session, self._screen),
+                    name="video_send",
                 )
-            if self._mic is not None or self._speaker is not None:
+                tasks.add(self._video_send_task)
+            if (
+                self._mic is not None or self._speaker is not None
+            ) and (self._owns_mic or self._owns_speaker):
                 tasks.add(
                     asyncio.create_task(
                         self._meter_loop(),
@@ -229,7 +303,7 @@ class LiveSession:
             for task in done:
                 exc = task.exception()
                 if exc is not None:
-                    reason = DisconnectReason("error", str(exc))
+                    reason = self._classify_disconnect(exc)
                     break
                 result = task.result()
                 if isinstance(result, DisconnectReason):
@@ -269,11 +343,45 @@ class LiveSession:
                     if self._shutdown_event.is_set():
                         break
 
+                    resumption_update = response.session_resumption_update
+                    if resumption_update is not None:
+                        if resumption_update.resumable:
+                            self._latest_resumption_handle = resumption_update.new_handle
+                            if self._on_resumption_handle is not None:
+                                await self._on_resumption_handle(
+                                    resumption_update.new_handle, True
+                                )
+                        else:
+                            if self._on_resumption_handle is not None:
+                                await self._on_resumption_handle(
+                                    resumption_update.new_handle, False
+                                )
+
+                    go_away = response.go_away
+                    if go_away is not None:
+                        time_left = go_away.time_left
+                        seconds = self._parse_time_left(time_left)
+                        await self._emit(SessionExpiring(seconds=seconds))
+                        return DisconnectReason("go_away", time_left)
+
                     server_content = response.server_content
                     if server_content:
                         events = self._turn_state.consume_server_content(server_content)
                         for event in events:
                             await self._emit(event)
+                            if isinstance(event, TurnComplete):
+                                completed_at = datetime.now(UTC).isoformat()
+                                unique_id = (
+                                    f"{self._run_id}-{self._epoch}-{event.turn_id}"
+                                )
+                                self._store.append_turn(
+                                    unique_id,
+                                    self._run_id,
+                                    event.source.value,
+                                    event.text,
+                                    completed_at,
+                                    self._epoch,
+                                )
 
                         # Play audio contained in the model turn.
                         model_turn = server_content.model_turn
@@ -323,7 +431,7 @@ class LiveSession:
         except Exception as exc:
             logger.exception("Receive loop failed")
             await self._emit(SessionError(message=str(exc), fatal=True))
-            return DisconnectReason("error", str(exc))
+            return self._classify_disconnect(exc)
 
         return API_CLOSE
 
@@ -364,13 +472,24 @@ class LiveSession:
                                 if cmd.monitor is not None
                                 else self._settings.screen_monitor,
                             )
+                            self._owns_screen = True
                             await self._screen.start()
-                            asyncio.create_task(
+                            self._video_send_task = asyncio.create_task(
+                                self._video_send_loop(session, self._screen),
+                                name="video_send_dynamic",
+                            )
+                        elif self._video_send_task is None or self._video_send_task.done():
+                            self._video_send_task = asyncio.create_task(
                                 self._video_send_loop(session, self._screen),
                                 name="video_send_dynamic",
                             )
                     else:
-                        if self._screen is not None:
+                        if self._video_send_task is not None and not self._video_send_task.done():
+                            self._video_send_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await self._video_send_task
+                            self._video_send_task = None
+                        if self._screen is not None and self._owns_screen:
                             await self._screen.stop()
                             self._screen = None
 
@@ -402,7 +521,7 @@ class LiveSession:
         except Exception as exc:
             logger.exception("Send loop failed")
             await self._emit(SessionError(message=str(exc), fatal=True))
-            return DisconnectReason("error", str(exc))
+            return self._classify_disconnect(exc)
 
     async def _audio_send_loop(self, session: Any, mic: Microphone) -> None:
         """Stream microphone PCM to the model."""
@@ -485,10 +604,10 @@ class LiveSession:
 
     def _make_respond_callback(
         self, session: Any
-    ) -> Callable[[str, str, ToolResult], Awaitable[None]]:
+    ) -> Callable[[str, str, ToolResult], Awaitable[bool]]:
         """Return the callback used by ``ToolDispatcher`` to reply to tool calls."""
 
-        async def respond(call_id: str, name: str, result: ToolResult) -> None:
+        async def respond(call_id: str, name: str, result: ToolResult) -> bool:
             await session.send_tool_response(
                 function_responses=[
                     types.FunctionResponse(
@@ -498,29 +617,87 @@ class LiveSession:
                     )
                 ]
             )
+            return True
 
         return respond
+
+    def _classify_disconnect(self, exc: BaseException) -> DisconnectReason:
+        """Map an exception to a structured disconnect reason."""
+        detail = str(exc)
+        if isinstance(exc, google.genai.errors.APIError):
+            status = getattr(exc, "status", None)
+            code = getattr(exc, "code", None)
+            if status in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
+                return DisconnectReason("auth_error", detail)
+            if status == "NOT_FOUND":
+                return DisconnectReason("not_found", detail)
+            if status == "RESOURCE_EXHAUSTED" or code == 429:
+                return DisconnectReason("quota", detail)
+            if status in ("UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED", "UNKNOWN"):
+                return DisconnectReason("transient", detail)
+
+        lowered = detail.lower()
+        if "resumption handle" in lowered and "rejected" in lowered:
+            return DisconnectReason("rejected_handle", detail)
+
+        if isinstance(exc, (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)):
+            return DisconnectReason("transient", detail)
+
+        return DisconnectReason("transient", detail)
+
+    def _parse_time_left(self, time_left: str | None) -> int | None:
+        """Parse a duration string such as ``'60s'`` into seconds."""
+        if time_left is None:
+            return None
+        match = re.search(r"\d+", time_left)
+        if match is None:
+            return None
+        return int(match.group())
+
+    async def send_client_content(
+        self, turns: list[types.Content], turn_complete: bool = True
+    ) -> None:
+        """Forward client content to the active API session."""
+        if self._session is None:
+            raise RuntimeError("not connected")
+        await self._session.send_client_content(
+            turns=turns, turn_complete=turn_complete
+        )
+
+    async def send_tool_response(self, call_id: str, name: str, result: ToolResult) -> None:
+        """Send a tool response to the active API session."""
+        if self._session is None:
+            raise RuntimeError("not connected")
+        await self._session.send_tool_response(
+            function_responses=[
+                types.FunctionResponse(
+                    id=call_id,
+                    name=name,
+                    response={"result": result.message},
+                )
+            ]
+        )
 
     async def _emit(self, event: Any) -> None:
         await self._event_queue.put(event)
 
     async def _stop_media(self) -> None:
-        """Stop microphone, speaker, and screen capture if they were started."""
-        if self._screen is not None:
+        """Stop microphone, speaker, and screen capture if the session owns them."""
+        if self._screen is not None and self._owns_screen:
             try:
                 await self._screen.stop()
             except Exception as exc:
                 logger.warning("Screen stop failed: %s", exc)
             self._screen = None
 
-        if self._mic is not None:
+        if self._mic is not None and self._owns_mic:
             try:
                 await self._mic.stop()
             except Exception as exc:
                 logger.warning("Mic stop failed: %s", exc)
             self._mic = None
 
-        if self._speaker is not None:
+        if self._speaker is not None and self._owns_speaker:
             try:
                 await self._speaker.stop()
             except Exception as exc:

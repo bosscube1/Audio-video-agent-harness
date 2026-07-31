@@ -28,7 +28,7 @@ def _human_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
-def read_file(args: ReadFileArgs) -> ToolResult:
+def read_file(args: ReadFileArgs, *, call_id: str = "") -> ToolResult:
     """Read a file, optionally constrained to a line range."""
     decision = _state._policy.evaluate("read_file", args)
     if decision.is_denied():
@@ -69,7 +69,7 @@ def read_file(args: ReadFileArgs) -> ToolResult:
     return ToolResult(True, header + content)
 
 
-def write_file(args: WriteFileArgs) -> ToolResult:
+def write_file(args: WriteFileArgs, *, call_id: str = "") -> ToolResult:
     """Write content to a file, creating parent directories as needed."""
     decision = _state._policy.evaluate("write_file", args)
     if decision.is_denied():
@@ -89,7 +89,7 @@ def write_file(args: WriteFileArgs) -> ToolResult:
         return ToolResult(False, f"Error writing file: {exc}")
 
 
-def list_directory(args: ListDirectoryArgs) -> ToolResult:
+def list_directory(args: ListDirectoryArgs, *, call_id: str = "") -> ToolResult:
     """List the contents of a directory."""
     decision = _state._policy.evaluate("list_directory", args)
     if decision.is_denied():
@@ -130,7 +130,7 @@ def list_directory(args: ListDirectoryArgs) -> ToolResult:
     return ToolResult(True, header + "\n".join(entries))
 
 
-def delete_file(args: DeleteFileArgs) -> ToolResult:
+def delete_file(args: DeleteFileArgs, *, call_id: str = "") -> ToolResult:
     """Delete a file or an empty directory."""
     decision = _state._policy.evaluate("delete_file", args)
     if decision.is_denied():

@@ -73,9 +73,10 @@ async def drain(queue: asyncio.Queue[Any]) -> list[Any]:
 
 def _capture_callback(
     responses: list[tuple[str, str, ToolResult]],
-) -> Callable[[str, str, ToolResult], Awaitable[None]]:
-    async def respond(call_id: str, name: str, result: ToolResult) -> None:
+) -> Callable[[str, str, ToolResult], Awaitable[bool]]:
+    async def respond(call_id: str, name: str, result: ToolResult) -> bool:
         responses.append((call_id, name, result))
+        return True
 
     return respond
 
