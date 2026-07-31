@@ -5,9 +5,9 @@
 - **Repository:** `C:\Users\Hp\projects\gemini-live-agent`
 - **Remote:** `https://github.com/bosscube1/Audio-video-agent-harness.git`
 - **Branch:** `Kimi-V2`
-- **Latest commit:** `ad3cebd` — `feat(phase2): headless core rewrite — session, media, tools, policy, audit`
-- **Phases complete:** 1 (foundation) and 2 (headless core extraction)
-- **Phase ready to start:** 3 (session lifetime / resumption)
+- **Latest commit:** `db75bad` — `feat(phase3): session lifetime, resumption, and reconnect`
+- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption)
+- **Phase ready to start:** 4 (GUI shell on a QThread)
 
 ## How to run right now
 
@@ -38,81 +38,57 @@ The first run migrates `GOOGLE_API_KEY` from `.env` into the Windows Credential 
 - **Audit + persistence:** append-only JSONL journal, SQLite store schema.
 - **Media layer:** explicit device selection, bounded mic queue, speaker generation-counter flush fix.
 - **Entry points:** `python -m gemini_live_agent`, `gemini-live-agent` console script, and `python main.py` all work.
+- **Phase 3 session lifetime:** `core/supervisor.py` reconnect loop, resumption-handle save/expire/seed, GoAway handling, classified backoff, failure budgets, in-flight tool-result delivery across reconnect.
+- **Single-epoch driver:** `core/session.py` now injects `ToolDispatcher`, `TurnState`, and media objects so the Supervisor can reuse them across epochs.
+- **Resumption support:** `settings/settings.py` builds `LiveConnectConfig` with `SessionResumptionConfig`; `persist/store.py` persists handles and seeds prior turns on fresh reconnects.
+- **Tool cancellation:** `core/dispatcher.py` can kill running shells via `tools/shell.cancel_shell`; cancelled ids never receive a `FunctionResponse`.
+- **Fake Live harness:** `tests/fakes/fake_live.py` scripts socket drops, GoAway, rejected handles, rejected `fc_id`s, and tool-call cancellation.
+- **Headless driver resilience:** `headless.py` now drives `Supervisor` instead of a single `LiveSession`.
 
-## Key design decisions already locked in
+## Key design decisions locked in
 
 - **Single process, asyncio core.** GUI will live on a `QThread` with Qt signals in, `loop.call_soon_threadsafe` out. `core/**` never imports PySide6; `app/**` never imports asyncio primitives.
 - **Frozen dataclasses across the thread boundary.** No shared mutable state.
 - **Meters polled, not pushed.** `AudioLevel` events exist but the GUI should poll `Microphone.level` / `Speaker.level` at ~30 Hz.
 - **Transcription coalesced to 80 ms in core.** `TurnState` emits at most one `PartialTranscript` per source per window.
-- **Typed text via `send_client_content`.** Verified working on `gemini-3.1-flash-live-preview` with `turn_complete=True`. This answers the Phase 2 open question; the Phase 3 reinjection fallback can use the same path.
+- **Typed text via `send_client_content`.** Verified working on `gemini-3.1-flash-live-preview` with `turn_complete=True`.
+- **Supervisor owns the long-lived conversation.** `LiveSession` is a single-epoch object; the Supervisor creates one per reconnect and reuses the dispatcher, turn state, and media.
+- **Resumption handles are persisted with a 110-minute TTL.** `Store` prunes expired handles and can seed prior turns as client content on fresh reconnects.
+- **Tool results are delivered across reconnects.** If the original `fc_id` is rejected, the result is reinjected as a system-note client turn.
+- **GoAway causes a hard reconnect, not overlapped.** Media stays alive; the old socket is closed and a new one is opened with the saved handle.
 
-## Immediate next: Phase 3 — Session Lifetime
+## Immediate next: Phase 4 — GUI shell on a QThread
 
-Phase 3 is the highest-leverage reliability work. The goal is to survive the ~10-minute WebSocket connection wall via resumption + proactive reconnect.
+The headless harness is now reconnect-resilient. The next high-leverage phase is a minimal PySide6 GUI that consumes the same event/command vocabulary.
 
 ### Files to create / change
 
-- `core/supervisor.py` — NEW. The conversation that survives sockets.
-- `core/session.py` — MODERATE. Add `session_epoch`, resumption handle plumbing, disconnect classification.
-- `persist/store.py` — ADD. Save/expire resumption handles.
-- `core/events.py` — ADD. `SessionExpiring`, `ContextReset` already exist; add `Reconnecting` if needed.
-- `tests/fakes/fake_live.py` — NEW. Highest-leverage test asset.
-- `tests/test_supervisor.py` — NEW.
+- `app/bridge.py` — NEW. Qt thread bridge: `QThread` runs the asyncio Supervisor; Qt signals in, `loop.call_soon_threadsafe` out.
+- `app/main_window.py` — NEW. Minimal window: connection state, transcript view, tool approval cards, audio level indicators, settings toggle.
+- `core/supervisor.py` — TWEAK if needed. Ensure events and commands cross the thread boundary cleanly (they are already frozen dataclasses).
+- `main.py` — ADD. When `--headless` is false, launch the GUI instead of `run_headless`.
 
 ### Implementation checklist
 
-1. **Fake Live session harness first.**
-   - Scriptable: drop socket, send `go_away`, reject handle, reject `fc_id`, send `tool_call_cancellation`.
-   - Must expose the same interface as `client.aio.live.connect(...) async with ...` so `LiveSession` can be tested against it.
+1. **Bridge first.** Create a `Bridge` that starts `Supervisor.run()` in a `QThread` and forwards `AgentEvent` objects to the main thread as Qt signals.
+2. **Main window.** Display `ConnectionState`, `PartialTranscript`/`TurnComplete`, `ToolApprovalRequested` cards, `ToolResultSent`, `ContextReset`, and `SessionError`. Poll audio levels via `Microphone.level` / `Speaker.level` at ~30 Hz.
+3. **Command wiring.** Connect GUI actions to `AgentCommand` objects pushed into the bridge's command queue: `SendText`, `ApproveTool`, `DenyTool`, `CancelTool`, `Disconnect`, `SetGatingMode`, `SetMicGate`, `SetShareScreen`.
+4. **Settings persistence.** Load/save `settings.json` via the existing `AppSettings.load()` path; expose the most common knobs (model, voice, mode, share-screen, input/output devices, yolo).
+5. **Headless still works.** Keep `run_headless` as the default; GUI is opt-in via `--no-headless` or a dedicated flag.
 
-2. **Day-1 live experiments.**
-   - Does `fc_id` survive a resumption reconnect? Run once against a real socket before building on the answer.
-   - Confirm `send_client_content` reinjection after reconnect lands as restored history, not a fresh user turn.
+### Phase 4 verification gate
 
-3. **Supervisor state machine.**
-   - States: `IDLE -> CONNECTING -> LIVE -> {DRAINING, RECONNECTING} -> CONNECTING -> LIVE`, `CLOSING -> CLOSED`, `FAILED`.
-   - Each socket generation gets a monotonic `session_epoch` stamped on every event/tool-call/audit record.
-
-4. **Resumption.**
-   - First connect: `session_resumption=types.SessionResumptionConfig(handle=None)`.
-   - Accept `new_handle` only when `resumable is True`.
-   - Persist handle to SQLite; expire locally at 110 min.
-
-5. **GoAway handling.**
-   - On `go_away.time_left`, transition to `DRAINING`, emit `SessionExpiring(seconds)`, stop accepting new tool calls, proactively reconnect.
-   - Hard cut: close, reconnect with handle, resume. Overlapped reconnect is explicitly Phase 5 cut-list.
-
-6. **Classified backoff.**
-   - Full jitter: `random.uniform(0, min(30, 0.5 * 2**attempt))`.
-   - Failure budget: 6 connects in 5 min -> `FAILED`.
-   - Auth/not-found -> no retry; quota -> base 5s cap 120s budget 3; transient -> base 0.5s cap 30s budget 6; rejected handle -> drop handle, one fresh reconnect, then transient.
-
-7. **In-flight tools across reconnect.**
-   - Journal-before-execute invariant already holds in dispatcher.
-   - `pending_approval` -> auto-deny, reason `connection_lost`.
-   - `running` -> let finish, journal, mark `orphaned`.
-   - On reconnect, try `send_tool_response` with original `fc_id`. On rejection, reinject as client content system note.
-   - No valid handle -> reconnect fresh, seed from SQLite, emit visible `ContextReset`.
-
-8. **`tool_call_cancellation` handling.**
-   - Queued tool -> drop.
-   - Awaiting approval -> dismiss card.
-   - Running shell -> `proc.kill()`; file ops -> let finish.
-   - Never send `FunctionResponse` for a cancelled id.
-
-### Phase 3 verification gate
-
-From the spec:
-
-> Against `FakeLiveSession` — socket drop mid-turn resumes and the conversation continues; GoAway drains and reconnects with < 1s audible gap; a `running` tool at drop time completes, is journaled, and its result reaches the model post-reconnect; rejected handle produces a visible `ContextReset`. Then live: a 30-minute real session with `--share-screen` on, crossing the ~10-minute connection wall repeatedly.
+- GUI starts without an API key and prompts for one.
+- Text-mode conversation survives a reconnect in the GUI (use the fake harness for unit tests; real socket for a short smoke test).
+- Tool approval card appears, approve/deny/cancel buttons work, and results update the transcript.
+- `ruff check .`, `mypy .`, and `pytest -q` all pass.
 
 ### Risks / known issues
 
-- **Old `scratch/` directory** at `C:\Users\Hp\.gemini\antigravity\scratch\gemini-live-agent` could not be deleted because this session had it locked. Remove it manually or wait until the session releases it.
-- **`python -m gemini_live_agent`** works because a `gemini_live_agent/` package exists. The directory name still has a hyphen; this is fine for local dev but will need a proper package layout before PyInstaller packaging.
-- **`.env` file still exists** in the repo root. `settings.secrets.migrate_dotenv()` moved the key into the credential store, but the file itself was left for Phase 4 deletion.
-- **Policy immutable dirs** currently use `GeminiLiveAgent` casing. Ensure this matches wherever `platformdirs` is called.
+- **Old `scratch/` directory** at `C:\Users\Hp\.gemini\antigravity\scratch\gemini-live-agent` still exists. Remove it manually if still locked.
+- **`.env` file still exists** in the repo root. It is ignored by git, but `settings.secrets.migrate_dotenv()` already moved the key into the credential store. Decide whether to delete the file or keep it as a dev-only convenience.
+- **Directory/package name still has a hyphen.** `python -m gemini_live_agent` works because of the `gemini_live_agent/` package, but a proper layout will be needed before PyInstaller packaging.
+- **Live 30-minute wall test** from the Phase 3 verification gate has not been run yet. Run it before declaring Phase 3 fully validated in production.
 
 ## Cut list (still valid)
 
@@ -134,15 +110,15 @@ cd C:\Users\Hp\projects\gemini-live-agent
 .venv\Scripts\pytest -q
 ```
 
-## Open questions from the original spec
+## Open questions
 
-1. **VB-Audio Virtual Cable default input** — explicit device selection is now implemented; the loopback guard is implemented in `media/devices.py`. Decision: it currently warns. If you want it to hard-refuse, change `detect_loopback()` callers.
-2. **Does `fc_id` survive resumption?** Phase 3 must answer this live before building on it. Fallback (client-content reinjection) already planned.
+1. **Does `fc_id` survive real resumption?** The fallback (system-note reinjection) is implemented and tested; a live socket still needs to confirm the happy path.
+2. **VB-Audio Virtual Cable loopback guard** currently warns. Change to hard-refuse if desired.
 3. **Close button minimize-to-tray?** Deferred to GUI Phase 5.
-4. **Should the model be told the policy?** Currently the system instruction mentions the workspace root and that destructive ops need approval. Consider adding allow-roots/command rules if denied calls become noisy.
+4. **Should the model be told the policy rules explicitly?** Currently only the workspace root and destructive-op approval are mentioned in the system instruction.
 5. **Single `.exe` vs. Inno Setup?** Deferred to Phase 6 packaging.
 6. **Searchable transcript across runs?** Left out.
 
-## Recommended first Phase 3 task
+## Recommended first Phase 4 task
 
-Build `tests/fakes/fake_live.py`. It is the highest-leverage test asset; you cannot reliably exercise drop/GoAway/rejected-handle/cancellation against the live preview API on demand.
+Create `app/bridge.py`: a `QThread` that owns the `asyncio` event loop and `Supervisor`, emits `AgentEvent` objects as Qt signals, and accepts `AgentCommand` objects via a slot that calls `loop.call_soon_threadsafe(queue.put_nowait, ...)`. This is the highest-leverage piece; once the bridge works, the rest of the GUI is just widgets consuming signals.
