@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QTimer, Slot
-from PySide6.QtGui import QAction, QTextCursor
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,11 +28,16 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QStyle,
+    QSystemTrayIcon,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -55,8 +62,10 @@ from core.events import (
     ContextReset,
     PartialTranscript,
     SessionError,
+    SessionExpiring,
     ToolApprovalRequested,
     ToolCallCancelled,
+    ToolCallReceived,
     ToolResultSent,
     TranscriptSource,
     TurnComplete,
@@ -74,6 +83,27 @@ _METER_INTERVAL_MS = 33
 logger = logging.getLogger(__name__)
 
 
+class _MicState(StrEnum):
+    """GUI-side microphone state machine (voice UX)."""
+
+    OFF = "off"
+    LIVE = "live"
+    MUTED = "muted"
+
+
+_MIC_CHIP_STYLES = {
+    _MicState.OFF: "color: #888;",
+    _MicState.LIVE: "color: #2e7d32; font-weight: bold;",
+    _MicState.MUTED: "color: #c62828; font-weight: bold;",
+}
+
+_MIC_CHIP_TEXT = {
+    _MicState.OFF: "Mic: off",
+    _MicState.LIVE: "Mic: live",
+    _MicState.MUTED: "Mic: muted",
+}
+
+
 class _ToolCard(QFrame):
     """Small widget that asks the user to approve/deny/cancel a tool call."""
 
@@ -81,6 +111,7 @@ class _ToolCard(QFrame):
         super().__init__(parent)
         self.call_id = event.call_id
         self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setAccessibleName(f"Tool approval request: {event.name}")
 
         layout = QVBoxLayout(self)
         layout.setSpacing(4)
@@ -94,9 +125,13 @@ class _ToolCard(QFrame):
         layout.addWidget(self._status)
 
         btn_layout = QHBoxLayout()
-        self._approve_btn = QPushButton("Approve")
-        self._deny_btn = QPushButton("Deny")
-        self._cancel_btn = QPushButton("Cancel")
+        # Mnemonics make the full approve/deny cycle keyboard-only.
+        self._approve_btn = QPushButton("&Approve")
+        self._approve_btn.setAccessibleName(f"Approve {event.name}")
+        self._deny_btn = QPushButton("&Deny")
+        self._deny_btn.setAccessibleName(f"Deny {event.name}")
+        self._cancel_btn = QPushButton("&Cancel")
+        self._cancel_btn.setAccessibleName(f"Cancel {event.name}")
         btn_layout.addWidget(self._approve_btn)
         btn_layout.addWidget(self._deny_btn)
         btn_layout.addWidget(self._cancel_btn)
@@ -121,12 +156,18 @@ class MainWindow(QMainWindow):
         self._last_source: TranscriptSource | None = None
         self._tool_cards: dict[str, _ToolCard] = {}
         self._mic_muted = False
+        self._mic_state = _MicState.OFF
+        self._sharing_active = False
+        self._force_quit = False
+        self._tray: QSystemTrayIcon | None = None
+        self._tray_message_shown = False
 
         self.setWindowTitle("Gemini Live Agent")
         self.setMinimumSize(720, 520)
         self._build_ui()
         self._populate_devices()
         self._load_settings_to_ui()
+        self._setup_tray()
 
     # -- UI construction --
 
@@ -136,12 +177,16 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(8)
 
-        # Status bar + connect button
+        # Status bar + mic state chip + connect button
         top_layout = QHBoxLayout()
         self._status_label = QLabel("Disconnected")
+        self._mic_chip = QLabel(_MIC_CHIP_TEXT[_MicState.OFF])
+        self._mic_chip.setStyleSheet(_MIC_CHIP_STYLES[_MicState.OFF])
+        self._mic_chip.setAccessibleName("Microphone state")
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._on_connect_clicked)
         top_layout.addWidget(self._status_label)
+        top_layout.addWidget(self._mic_chip)
         top_layout.addStretch()
         top_layout.addWidget(self._connect_btn)
         main_layout.addLayout(top_layout)
@@ -199,6 +244,10 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self._yolo_check, row, 0, 1, 2)
 
         row += 1
+        self._tray_check = QCheckBox("Minimize to tray on close")
+        settings_layout.addWidget(self._tray_check, row, 0, 1, 2)
+
+        row += 1
         self._working_dir_edit = QLineEdit()
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._on_browse_working_dir)
@@ -213,11 +262,29 @@ class MainWindow(QMainWindow):
         save_settings_btn.clicked.connect(self._on_save_settings)
         settings_layout.addWidget(save_settings_btn, row, 1)
 
-        # Transcript
+        # Screen-share indicator banner (visible only while sharing + connected)
+        self._share_banner = QLabel("● Sharing screen — the model can see your screen")
+        self._share_banner.setStyleSheet(
+            "color: #b71c1c; font-weight: bold; padding: 2px;"
+        )
+        self._share_banner.setAccessibleName("Screen sharing indicator")
+        self._share_banner.setVisible(False)
+        main_layout.addWidget(self._share_banner)
+
+        # Transcript + activity feed tabs
+        self._tabs = QTabWidget()
+
         self._transcript = QTextEdit()
         self._transcript.setReadOnly(True)
         self._transcript.setPlaceholderText("Transcript will appear here...")
-        main_layout.addWidget(self._transcript, stretch=1)
+        self._transcript.setAccessibleName("Conversation transcript")
+        self._tabs.addTab(self._transcript, "Transcript")
+
+        self._activity = QListWidget()
+        self._activity.setAccessibleName("Activity feed")
+        self._tabs.addTab(self._activity, "Activity")
+
+        main_layout.addWidget(self._tabs, stretch=1)
 
         # Tool approvals
         self._tool_scroll = QScrollArea()
@@ -248,16 +315,23 @@ class MainWindow(QMainWindow):
         bottom_layout = QHBoxLayout()
         self._input_edit = QLineEdit()
         self._input_edit.setPlaceholderText("Type a message and press Enter...")
+        self._input_edit.setAccessibleName("Message input")
         self._input_edit.returnPressed.connect(self._on_send_clicked)
         self._send_btn = QPushButton("Send")
         self._send_btn.clicked.connect(self._on_send_clicked)
         self._mute_btn = QPushButton("Mute mic")
         self._mute_btn.setCheckable(True)
+        self._mute_btn.setAccessibleName("Toggle microphone mute")
         self._mute_btn.toggled.connect(self._on_mute_toggled)
         bottom_layout.addWidget(self._input_edit)
         bottom_layout.addWidget(self._send_btn)
         bottom_layout.addWidget(self._mute_btn)
         main_layout.addLayout(bottom_layout)
+
+        # Usage panel in the status bar (updated on UsageUpdate events)
+        self._usage_label = QLabel("0 tokens")
+        self._usage_label.setAccessibleName("Token usage")
+        self.statusBar().addPermanentWidget(self._usage_label)
 
         # Meter timer
         self._meter_timer = QTimer(self)
@@ -270,6 +344,10 @@ class MainWindow(QMainWindow):
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         self.menuBar().addAction(exit_action)
+
+        # Ctrl+M toggles the mic gate from anywhere in the window.
+        mute_shortcut = QShortcut(QKeySequence("Ctrl+M"), self)
+        mute_shortcut.activated.connect(self._mute_btn.toggle)
 
     def _populate_devices(self) -> None:
         """Fill the input/output device combos from sounddevice."""
@@ -297,6 +375,7 @@ class MainWindow(QMainWindow):
         self._share_screen_check.setChecked(self._settings.share_screen)
         self._fps_spin.setValue(self._settings.screen_fps)
         self._yolo_check.setChecked(self._settings.yolo)
+        self._tray_check.setChecked(self._settings.minimize_to_tray)
         self._working_dir_edit.setText(str(self._settings.working_dir))
         if self._settings.input_device:
             self._input_device_combo.setCurrentText(self._settings.input_device)
@@ -319,6 +398,7 @@ class MainWindow(QMainWindow):
             input_device=self._input_device_combo.currentData(),
             output_device=self._output_device_combo.currentData(),
             yolo=self._yolo_check.isChecked(),
+            minimize_to_tray=self._tray_check.isChecked(),
             headless=False,
             debug=self._settings.debug,
         )
@@ -339,6 +419,92 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._working_dir_edit.setText(path)
+
+    # -- System tray --
+
+    def _setup_tray(self) -> None:
+        """Create the tray icon when the platform supports it."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.info("System tray not available; minimize-to-tray disabled")
+            return
+
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Gemini Live Agent")
+
+        menu = QMenu()
+        show_action = menu.addAction("Show / Hide")
+        show_action.triggered.connect(self._on_tray_show_hide)
+        mute_action = menu.addAction("Mute mic")
+        mute_action.triggered.connect(self._mute_btn.toggle)
+        menu.addSeparator()
+        quit_action = menu.addAction("Quit")
+        quit_action.triggered.connect(self._on_tray_quit)
+        self._tray.setContextMenu(menu)
+
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_show_hide(self) -> None:
+        if self.isVisible():
+            self.hide()
+        else:
+            self.showNormal()
+            self.activateWindow()
+
+    def _on_tray_quit(self) -> None:
+        self._force_quit = True
+        self.close()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._on_tray_show_hide()
+
+    # -- Activity feed / usage / mic chip / share banner --
+
+    def _add_activity(self, text: str) -> None:
+        """Append a timestamped line to the activity feed."""
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self._activity.addItem(f"{stamp}  {text}")
+        self._activity.scrollToBottom()
+
+    def _update_usage(self, event: UsageUpdate) -> None:
+        parts = [f"{event.total_tokens} tokens"]
+        detail = f"in {event.prompt_tokens} / out {event.completion_tokens}"
+        if event.cached_tokens:
+            detail += f" / cached {event.cached_tokens}"
+        parts.append(detail)
+        if event.estimated_usd:
+            parts.append(f"~${event.estimated_usd:.4f}")
+        self._usage_label.setText("  ·  ".join(parts))
+        self._usage_label.setToolTip(
+            f"audio {event.audio_tokens} · video {event.video_tokens}"
+        )
+
+    def _set_mic_state(self, state: _MicState) -> None:
+        if state == self._mic_state:
+            return
+        self._mic_state = state
+        self._mic_chip.setText(_MIC_CHIP_TEXT[state])
+        self._mic_chip.setStyleSheet(_MIC_CHIP_STYLES[state])
+        self._add_activity(_MIC_CHIP_TEXT[state])
+
+    def _refresh_mic_state(self) -> None:
+        """Recompute the mic chip from connection state, mode, and mute flag."""
+        connected = self._bridge is not None and self._status_label.text() in (
+            ConnectionState.LIVE.value,
+            ConnectionState.DRAINING.value,
+        )
+        wants_mic = self._mode_combo.currentText().lower() != "text"
+        if not connected or not wants_mic:
+            self._set_mic_state(_MicState.OFF)
+        elif self._mic_muted:
+            self._set_mic_state(_MicState.MUTED)
+        else:
+            self._set_mic_state(_MicState.LIVE)
+
+    def _update_share_banner(self) -> None:
+        self._share_banner.setVisible(self._sharing_active)
 
     # -- Bridge lifecycle --
 
@@ -363,6 +529,10 @@ class MainWindow(QMainWindow):
         self._connect_btn.setText("Disconnect")
         self._settings_widget.setEnabled(False)
 
+        self._sharing_active = settings.share_screen
+        self._update_share_banner()
+        self._add_activity(f"Connecting (model {settings.model})...")
+
         # Reflect UI toggles in the freshly started core.
         if settings.yolo:
             self._bridge.send_command(SetGatingMode(mode=GatingMode.YOLO))
@@ -386,6 +556,10 @@ class MainWindow(QMainWindow):
         self._settings_widget.setEnabled(True)
         self._mic_meter.setValue(0)
         self._speaker_meter.setValue(0)
+        self._sharing_active = False
+        self._update_share_banner()
+        self._refresh_mic_state()
+        self._add_activity(f"Disconnected ({reason})")
 
     # -- Event handling --
 
@@ -393,6 +567,10 @@ class MainWindow(QMainWindow):
     def _on_event(self, event: AgentEvent) -> None:
         if isinstance(event, ConnectionStateChanged):
             self._status_label.setText(event.state.value)
+            self._add_activity(
+                f"Connection: {event.state.value}"
+                + (f" — {event.detail}" if event.detail else "")
+            )
             if event.detail:
                 self._status_label.setToolTip(event.detail)
             if event.state == ConnectionState.DISCONNECTED:
@@ -401,27 +579,44 @@ class MainWindow(QMainWindow):
             elif event.state == ConnectionState.LIVE:
                 self._connect_btn.setText("Disconnect")
                 self._settings_widget.setEnabled(False)
+            self._refresh_mic_state()
         elif isinstance(event, PartialTranscript):
             self._append_partial(event.text, event.source)
         elif isinstance(event, TurnComplete):
             self._append_system(f"[TURN COMPLETE] {event.source.value}")
             self._last_source = None
+        elif isinstance(event, ToolCallReceived):
+            self._add_activity(f"Tool call: {event.name}")
         elif isinstance(event, ToolApprovalRequested):
             self._add_tool_card(event)
+            self._add_activity(f"Approval requested: {event.name}")
         elif isinstance(event, ToolResultSent):
             self._update_tool_card(event)
+            self._add_activity(
+                f"Tool result: {event.name} -> {'OK' if event.ok else 'FAILED'}"
+            )
         elif isinstance(event, ToolCallCancelled):
             self._update_tool_card_cancelled(event)
+            self._add_activity(f"Tool cancelled: {event.reason}")
         elif isinstance(event, ContextReset):
             self._append_system(f"[RESET] {event.reason}")
+            self._add_activity(f"Context reset: {event.reason}")
+        elif isinstance(event, SessionExpiring):
+            notice = (
+                f"Session expiring in {event.seconds}s; reconnecting..."
+                if event.seconds is not None
+                else "Session expiring; reconnecting..."
+            )
+            self._append_system(f"[EXPIRING] {notice}")
+            self._add_activity(notice)
         elif isinstance(event, SessionError):
+            self._add_activity(f"Error: {event.message}")
             if event.fatal:
                 QMessageBox.critical(self, "Session error", event.message)
             else:
                 self._append_system(f"[ERROR] {event.message}")
         elif isinstance(event, UsageUpdate):
-            # Intentionally not displayed in the minimal UI.
-            pass
+            self._update_usage(event)
         elif isinstance(event, AudioLevel):
             # Levels are polled via _update_meters; ignore pushed events.
             pass
@@ -512,6 +707,7 @@ class MainWindow(QMainWindow):
         self._mute_btn.setText("Unmute mic" if checked else "Mute mic")
         if self._bridge is not None:
             self._bridge.send_command(SetMicGate(open=not checked))
+        self._refresh_mic_state()
 
     @Slot()
     def _update_meters(self) -> None:
@@ -525,11 +721,32 @@ class MainWindow(QMainWindow):
     # -- Window close --
 
     def closeEvent(self, event: Any) -> None:
+        # Minimize to the tray instead of quitting when the setting is on.
+        if (
+            not self._force_quit
+            and self._tray_check.isChecked()
+            and self._tray is not None
+            and self._tray.isVisible()
+        ):
+            self.hide()
+            if not self._tray_message_shown:
+                self._tray_message_shown = True
+                self._tray.showMessage(
+                    "Gemini Live Agent",
+                    "Still running in the tray. Use Quit in the tray menu to exit.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+            event.ignore()
+            return
+
         if self._bridge is not None:
             self._bridge.stop()
             self._bridge.wait()
             self._bridge.deleteLater()
             self._bridge = None
+        if self._tray is not None:
+            self._tray.hide()
         event.accept()
 
 

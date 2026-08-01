@@ -87,6 +87,7 @@ class AppSettings(BaseSettings):
     yolo: bool = False
     headless: bool = True
     debug: bool = False
+    minimize_to_tray: bool = True
 
     @field_validator("voice")
     @classmethod

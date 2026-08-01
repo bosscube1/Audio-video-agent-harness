@@ -5,9 +5,19 @@
 - **Repository:** `C:\Users\Hp\projects\gemini-live-agent`
 - **Remote:** `https://github.com/bosscube1/Audio-video-agent-harness.git`
 - **Branch:** `Kimi-V2`
-- **Latest commit:** `e9632d9` — `feat(media): barge-in — stop playback the moment the server interrupts` *(pushed to origin)*
-- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption / barge-in)
-- **Phase ready to start:** 4 (GUI shell on a QThread)
+- **Latest commit:** *(update after next commit)* — Phase 5 GUI control surfaces & voice UX
+- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption / barge-in), 4 (GUI shell on a QThread), 5 (GUI control surfaces + voice UX polish)
+- **Phase ready to start:** 6 (persistence, packaging, hardening)
+
+## Phase 5 additions (GUI)
+
+- **Usage panel** — status-bar label fed by `UsageUpdate` (total / in / out / cached tokens, est. cost).
+- **Activity feed** — second tab logging connection changes, tool calls, approvals, results, resets, errors with timestamps.
+- **Mic state machine** — `_MicState` OFF/LIVE/MUTED chip next to the status label; `Ctrl+M` mute shortcut; follows connection state, mode, and mute toggle.
+- **System tray** — `QSystemTrayIcon` with Show/Hide, Mute, Quit; close button minimizes to tray when `minimize_to_tray` is enabled (new persisted `AppSettings` field); tray Quit forces a real exit.
+- **Screen-share indicator** — red banner while a share-screen session is connected.
+- **Accessibility** — `&Approve`/`&Deny`/`&Cancel` mnemonics on tool cards, accessible names on transcript/feed/meters/input.
+- **Tests** — `tests/test_gui_phase5.py` (9 tests): usage panel, activity feed, mic chip transitions, share banner, tray hide/quit, card mnemonics.
 
 ## How to run right now
 
@@ -58,37 +68,35 @@ The first run migrates `GOOGLE_API_KEY` from `.env` into the Windows Credential 
 - **Tool results are delivered across reconnects.** If the original `fc_id` is rejected, the result is reinjected as a system-note client turn.
 - **GoAway causes a hard reconnect, not overlapped.** Media stays alive; the old socket is closed and a new one is opened with the saved handle.
 
-## Immediate next: Phase 4 — GUI shell on a QThread
+## Immediate next: Phase 6 — persistence, packaging, hardening
 
-The headless harness is now reconnect-resilient and supports barge-in. The next high-leverage phase is a minimal PySide6 GUI that consumes the same event/command vocabulary.
+Phases 4 and 5 are done: the GUI shell runs on a QThread bridge and now has
+control surfaces (usage panel, activity feed, approval cards) plus voice UX
+(mic state machine, tray, share indicator, keyboard mnemonics).
 
-`main.py` already accepts `--headless` / `--no-headless` and passes `headless` through `AppSettings`, but the non-headless path raises `ValueError("GUI mode is not yet implemented; run with --headless")`. Implement the GUI path.
+### Phase 6 scope (from Context.txt)
 
-### Files to create / change
+- **Incremental SQLite history** written as turns complete (`persist/store.py`
+  already has the schema).
+- **Wheel check first.** `pyproject.toml` has `packages = [".", "gemini_live_agent"]`;
+  run `python -m build` and inspect the wheel to confirm `app/`, `core/`,
+  `media/`, `tools/`, `policy/`, `audit/`, `obs/`, `persist/`, `settings/` all
+  land in it. Fix the target layout before touching PyInstaller.
+- **PyInstaller spec.** Hidden imports for `sounddevice`'s `_sounddevice_data`
+  DLL and `mss`; aggressively exclude PySide6 plugins (QtWebEngine, Qt3D,
+  QtCharts, QtQuick, QtMultimedia, translations) or the exe exceeds 300 MB.
+  Prefer **onedir + Inno Setup** over `--onefile` (3-8 s cold start per launch
+  otherwise). Version resource + icon.
+- **Phase 6 gate:** built exe launches on a clean path with no `.env` and no
+  source tree, prompts for the API key, completes a voice turn, and writes
+  state under `%LOCALAPPDATA%`.
 
-- `app/bridge.py` — NEW. Qt thread bridge: `QThread` runs the asyncio Supervisor; Qt signals in, `loop.call_soon_threadsafe` out.
-- `app/main_window.py` — NEW. Minimal window: connection state, transcript view, tool approval cards, audio level indicators, settings toggle.
-- `app/__init__.py` — NEW. Package marker.
-- `core/supervisor.py` — TWEAK if needed. Ensure events and commands cross the thread boundary cleanly (they are already frozen dataclasses).
-- `main.py` — REPLACE. When `settings.headless` is false, launch the GUI instead of `run_headless`.
-- `pyproject.toml` — VERIFY. PySide6 and pytest-qt are already declared; confirm the wheel target includes `.` and `gemini_live_agent` plus `app/` if it becomes a separate package (or keep `app/` under the root package layout).
+### Remaining Phase 5 verification (manual, needs real hardware/session)
 
-### Implementation checklist
-
-1. **Bridge first.** Create a `Bridge` that starts `Supervisor.run()` in a `QThread` and forwards `AgentEvent` objects to the main thread as Qt signals. Provide a slot that accepts `AgentCommand` objects and calls `loop.call_soon_threadsafe(queue.put_nowait, ...)`.
-2. **Main window.** Display `ConnectionState`, `PartialTranscript`/`TurnComplete`, `ToolApprovalRequested` cards, `ToolResultSent`, `ContextReset`, and `SessionError`. Poll audio levels via `Microphone.level` / `Speaker.level` at ~30 Hz.
-3. **Command wiring.** Connect GUI actions to `AgentCommand` objects pushed into the bridge's command queue: `SendText`, `ApproveTool`, `DenyTool`, `CancelTool`, `Disconnect`, `SetGatingMode`, `SetMicGate`, `SetShareScreen`.
-4. **Settings persistence.** Load/save `settings.json` via the existing `AppSettings.load()` path; expose the most common knobs (model, voice, mode, share-screen, input/output devices, yolo).
-5. **Headless still works.** Keep `run_headless` as the default; GUI is opt-in via `--no-headless`.
-6. **Tests.** Add `tests/test_gui_bridge.py` or `tests/test_gui_lifecycle.py` using `pytest-qt` to verify the bridge starts, emits events, and forwards commands without deadlocking. Add a smoke test that `--no-headless` instantiates the GUI window in a non-interactive QApplication and exits cleanly.
-
-### Phase 4 verification gate
-
-- GUI starts without an API key and prompts for one.
-- Text-mode conversation survives a reconnect in the GUI (use the fake harness for unit tests; real socket for a short smoke test).
-- Tool approval card appears, approve/deny/cancel buttons work, and results update the transcript.
-- `ruff check .`, `mypy .`, and `pytest -q` all pass.
-- `--headless` still runs the terminal driver exactly as before.
+- 20-minute streaming session while dragging the window and opening a native
+  file dialog — zero audio dropouts.
+- Full approve/deny cycle by keyboard only (mnemonics are in place).
+- Screen reader announces transcript rows and approval buttons.
 
 ### Risks / known issues
 
@@ -97,6 +105,7 @@ The headless harness is now reconnect-resilient and supports barge-in. The next 
 - **Directory/package name still has a hyphen.** `python -m gemini_live_agent` works because of the `gemini_live_agent/` package, but a proper layout will be needed before PyInstaller packaging.
 - **Live 30-minute wall test** from the Phase 3 verification gate has not been run yet. Run it before declaring Phase 3 fully validated in production.
 - **`.claude/` worktree cleanup** was attempted: the `claude/adoring-wright-c18ce1` worktree metadata was removed from git, but the empty `.claude/worktrees/adoring-wright-c18ce1` directory could not be deleted because Windows reports it as "Device or resource busy" (likely held by a shell or explorer). Reboot or close the holding process, then delete `.claude/` manually.
+- **Global hotkeys** (system-wide mute/push-to-talk) were not implemented in Phase 5 — no cross-platform hotkey dependency is declared. Revisit after packaging.
 
 ## Cut list (still valid)
 
@@ -122,11 +131,14 @@ cd C:\Users\Hp\projects\gemini-live-agent
 
 1. **Does `fc_id` survive real resumption?** The fallback (system-note reinjection) is implemented and tested; a live socket still needs to confirm the happy path.
 2. **VB-Audio Virtual Cable loopback guard** currently warns. Change to hard-refuse if desired.
-3. **Close button minimize-to-tray?** Deferred to GUI Phase 5.
+3. **Close button minimize-to-tray?** Resolved in Phase 5 — tray icon with Show/Hide, Mute, Quit; close minimizes to tray (persisted `minimize_to_tray` setting).
 4. **Should the model be told the policy rules explicitly?** Currently only the workspace root and destructive-op approval are mentioned in the system instruction.
-5. **Single `.exe` vs. Inno Setup?** Deferred to Phase 6 packaging.
-6. **Searchable transcript across runs?** Left out.
+5. **Single `.exe` vs. Inno Setup?** Leaning onedir + Inno Setup per Context.txt; decide during Phase 6 packaging.
+6. **Searchable transcript across runs?** Left out; Phase 6's incremental SQLite history is the prerequisite.
 
-## Recommended first Phase 4 task
+## Recommended first Phase 6 task
 
-Create `app/bridge.py`: a `QThread` that owns the `asyncio` event loop and `Supervisor`, emits `AgentEvent` objects as Qt signals, and accepts `AgentCommand` objects via a slot that calls `loop.call_soon_threadsafe(queue.put_nowait, ...)`. This is the highest-leverage piece; once the bridge works, the rest of the GUI is just widgets consuming signals.
+Run `python -m build` and inspect the produced wheel. Confirm every runtime
+package (`app/`, `core/`, `media/`, `tools/`, `policy/`, `audit/`, `obs/`,
+`persist/`, `settings/`, `gemini_live_agent/`) is included, and fix the
+hatch `packages` target before writing the PyInstaller spec.

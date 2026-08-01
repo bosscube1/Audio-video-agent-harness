@@ -31,6 +31,7 @@ def settings(workspace: Path) -> AppSettings:
         working_dir=workspace,
         workspace_root=workspace,
         share_screen=False,
+        minimize_to_tray=False,
     )
 
 
