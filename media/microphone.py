@@ -122,7 +122,6 @@ class Microphone:
             logger.warning("Mic callback warning: %s", status)
 
         chunk = bytes(indata)
-        self._update_level(chunk)
 
         if self._loop is None or self._loop.is_closed():
             return
@@ -135,6 +134,7 @@ class Microphone:
     # -- Queue bridging --
 
     def _enqueue_chunk(self, chunk: bytes) -> None:
+        self._update_level(chunk)
         if not self._gate_open:
             return
         if self._queue.full():

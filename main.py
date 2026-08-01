@@ -115,7 +115,7 @@ def main() -> int:
     args = parse_args()
 
     migrate_dotenv()
-    if get_api_key() is None:
+    if args.headless and get_api_key() is None:
         _prompt_for_api_key()
 
     working_dir = Path(args.working_dir)
@@ -134,11 +134,12 @@ def main() -> int:
         debug=args.debug,
     )
 
-    # Phase 2 only supports the headless terminal driver.
     if settings.headless:
         return asyncio.run(run_headless(settings))
 
-    raise ValueError("GUI mode is not yet implemented; run with --headless")
+    from app.main_window import run_gui
+
+    return run_gui(settings)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ class _StubStream:
         self.written: list[bytes] = []
         self.aborts = 0
         self.starts = 0
+        self.closes = 0
 
     def write(self, chunk: bytes) -> None:
         self.written.append(chunk)
@@ -47,7 +48,7 @@ class _StubStream:
         pass
 
     def close(self) -> None:
-        pass
+        self.closes += 1
 
 
 class RecordingSpeaker:
@@ -87,8 +88,15 @@ class RecordingSpeaker:
 
 def test_flush_drops_queued_audio_and_resets_the_stream() -> None:
     """Queued chunks are discarded and the device buffer is aborted."""
-    speaker = Speaker()
     stream = _StubStream()
+    created = [stream]
+
+    def factory(**_kwargs: Any) -> _StubStream:
+        new = _StubStream()
+        created.append(new)
+        return new
+
+    speaker = Speaker(stream_factory=factory)
     speaker._stream = stream
     speaker._active = True
 
@@ -99,17 +107,25 @@ def test_flush_drops_queued_audio_and_resets_the_stream() -> None:
     speaker.flush()
 
     assert speaker._queue.qsize() == 0
-    # abort() discards what PortAudio already buffered; start() re-arms the
-    # stream for the next turn.
+    # The old stream is aborted and closed, and a fresh stream is opened for
+    # the next turn (recreating avoids Windows MME errors restarting the same
+    # aborted stream).
     assert stream.aborts == 1
-    assert stream.starts == 1
+    assert stream.closes == 1
+    assert len(created) == 2
+    assert created[1].starts == 1
+    assert speaker._stream is created[1]
     assert speaker.level == 0.0
 
 
 def test_writer_discards_chunks_queued_before_a_flush() -> None:
     """A chunk that survives the drain is still dropped by its generation tag."""
-    speaker = Speaker()
     stream = _StubStream()
+
+    def factory(**_kwargs: Any) -> _StubStream:
+        return _StubStream()
+
+    speaker = Speaker(stream_factory=factory)
     speaker._stream = stream
     speaker._active = True
 
@@ -138,7 +154,10 @@ def test_flush_survives_a_stream_that_fails_to_abort() -> None:
         def abort(self) -> None:
             raise RuntimeError("device gone")
 
-    speaker = Speaker()
+    def factory(**_kwargs: Any) -> _StubStream:
+        return _StubStream()
+
+    speaker = Speaker(stream_factory=factory)
     speaker._stream = _AngryStream()
     speaker._active = True
     speaker.write(b"\x01\x00" * 100)

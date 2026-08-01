@@ -126,6 +126,22 @@ class AppSettings(BaseSettings):
 
         return self
 
+    def save(self) -> None:
+        """Persist user-editable settings to the settings JSON file.
+
+        API keys are never written to disk; headless/debug are runtime CLI flags
+        and are also excluded.
+        """
+        settings_dir = Path(user_config_dir("GeminiLiveAgent", appauthor=False))
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        settings_file = settings_dir / "settings.json"
+
+        data = self.model_dump(exclude={"api_key", "headless", "debug"})
+        settings_file.write_text(
+            json.dumps(data, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+
     @classmethod
     def load(cls, **overrides: Any) -> AppSettings:
         """Load settings from the user settings file, env vars, and optional overrides.

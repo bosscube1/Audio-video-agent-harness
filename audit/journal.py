@@ -64,9 +64,13 @@ class Journal:
             self._file = self._path.open("a", encoding="utf-8")
         return self._file
 
-    def _close(self) -> None:
+    def close(self) -> None:
+        """Close the journal file handle, flushing any buffered writes."""
         if self._file is not None and not self._file.closed:
             self._file.close()
+
+    # Backward-compatible alias; prefer ``close()``.
+    _close = close
 
     def _now_iso(self) -> str:
         return datetime.now(UTC).isoformat()

@@ -31,12 +31,18 @@ class Speaker:
     by the writer.
     """
 
-    def __init__(self, device: str | int | None = None) -> None:
+    def __init__(
+        self,
+        device: str | int | None = None,
+        *,
+        stream_factory: Any = sd.RawOutputStream,
+    ) -> None:
         if isinstance(device, str):
             self._device_index = devices.validate_device(device, "output")
         else:
             self._device_index = device
 
+        self._stream_factory = stream_factory
         self._stream: Any | None = None
         self._active = False
         self._queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
@@ -52,7 +58,7 @@ class Speaker:
 
     async def start(self) -> None:
         """Open the speaker output stream and start the writer thread."""
-        self._stream = sd.RawOutputStream(
+        self._stream = self._stream_factory(
             samplerate=OUTPUT_SAMPLE_RATE,
             channels=CHANNELS,
             dtype=DTYPE,
@@ -102,8 +108,10 @@ class Speaker:
         Draining the queue alone is not enough to stop the model mid-sentence:
         PortAudio has already buffered whatever was handed to ``write()``, and
         the writer thread may be blocked inside a ``stream.write()`` call that
-        only returns at playback speed. So the stream is aborted (which discards
-        the device buffer) and restarted for the next turn.
+        only returns at playback speed. We abort the current stream, close it,
+        and open a fresh one for the next turn. On Windows MME, restarting an
+        aborted stream often fails with "media data is still playing", so we
+        always recreate the stream instead.
         """
         with self._lock:
             self._generation += 1
@@ -125,10 +133,21 @@ class Speaker:
         try:
             with contextlib.suppress(Exception):
                 stream.abort()
+            with contextlib.suppress(Exception):
+                stream.close()
+
             try:
-                stream.start()
+                new_stream = self._stream_factory(
+                    samplerate=OUTPUT_SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype=DTYPE,
+                    device=self._device_index,
+                )
+                new_stream.start()
+                self._stream = new_stream
             except Exception as exc:  # pragma: no cover - device dependent
-                logger.warning("Speaker restart after flush failed: %s", exc)
+                logger.warning("Speaker stream recreate after flush failed: %s", exc)
+                self._stream = None
         finally:
             self._flushing.clear()
 
