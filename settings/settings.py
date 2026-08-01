@@ -193,6 +193,17 @@ class AppSettings(BaseSettings):
                 parts=[types.Part(text=instruction_text)]
             ),
             tools=tools,
+            # Server-side VAD. START_OF_ACTIVITY_INTERRUPTS makes the model stop
+            # generating as soon as the user starts speaking, instead of
+            # finishing its turn and queueing the user's speech behind it.
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    prefix_padding_ms=self.vad_prefix_padding_ms,
+                    silence_duration_ms=self.vad_silence_duration_ms,
+                ),
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            ),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             context_window_compression=types.ContextWindowCompressionConfig(

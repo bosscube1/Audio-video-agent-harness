@@ -366,6 +366,13 @@ class LiveSession:
 
                     server_content = response.server_content
                     if server_content:
+                        # Barge-in: the server detected user speech and aborted
+                        # the model turn. Kill queued playback first, before any
+                        # other handling, so the model stops mid-sentence rather
+                        # than finishing the response it already generated.
+                        if server_content.interrupted and self._speaker is not None:
+                            self._speaker.flush()
+
                         events = self._turn_state.consume_server_content(server_content)
                         for event in events:
                             await self._emit(event)

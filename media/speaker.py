@@ -43,6 +43,7 @@ class Speaker:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._generation = 0
+        self._flushing = threading.Event()
 
         self._last_level = 0.0
         self._level_lock = threading.Lock()
@@ -96,14 +97,44 @@ class Speaker:
         self._queue.put((generation, pcm_bytes))
 
     def flush(self) -> None:
-        """Drop all queued audio immediately, e.g. on barge-in."""
+        """Drop all pending audio immediately, e.g. on barge-in.
+
+        Draining the queue alone is not enough to stop the model mid-sentence:
+        PortAudio has already buffered whatever was handed to ``write()``, and
+        the writer thread may be blocked inside a ``stream.write()`` call that
+        only returns at playback speed. So the stream is aborted (which discards
+        the device buffer) and restarted for the next turn.
+        """
         with self._lock:
             self._generation += 1
-            while True:
-                with contextlib.suppress(queue.Empty):
-                    self._queue.get_nowait()
-                    continue
+            stream = self._stream
+            active = self._active
+
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
                 break
+
+        if stream is None or not active:
+            return
+
+        # Tell the writer to stand down while the stream is torn down and
+        # rebuilt, so it does not write into a stopped stream.
+        self._flushing.set()
+        try:
+            with contextlib.suppress(Exception):
+                stream.abort()
+            try:
+                stream.start()
+            except Exception as exc:  # pragma: no cover - device dependent
+                logger.warning("Speaker restart after flush failed: %s", exc)
+        finally:
+            self._flushing.clear()
+
+        with self._level_lock:
+            self._last_level = 0.0
+        logger.info("[SPK] Playback flushed (barge-in)")
 
     @property
     def is_playing(self) -> bool:
@@ -131,7 +162,7 @@ class Speaker:
 
             if not active or generation != current_generation:
                 continue
-            if self._stream is None:
+            if self._stream is None or self._flushing.is_set():
                 continue
 
             try:

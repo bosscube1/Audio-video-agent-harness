@@ -26,20 +26,20 @@ class Connect:
     """Start (or restart) a conversation with the given settings."""
 
     settings: dict[str, Any]
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Disconnect:
     """Gracefully end the current session."""
 
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class SendText:
     text: str
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,40 +47,40 @@ class SetMicGate:
     """Open or close the microphone gate. False = muted."""
 
     open: bool
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class SetShareScreen:
     enabled: bool
     monitor: int | None = None
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class ApproveTool:
     call_id: str
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class DenyTool:
     call_id: str
     reason: str = "user_denied"
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class CancelTool:
     call_ids: list[str]
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class SetGatingMode:
     mode: GatingMode
     duration_minutes: int | None = None
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 # Convenience union.

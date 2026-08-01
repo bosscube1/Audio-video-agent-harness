@@ -182,6 +182,10 @@ class FakeLiveSession:
             )
         )
 
+    def interrupt(self) -> None:
+        """Enqueue a barge-in: the server aborted the model turn."""
+        self.emit(_message(server_content=_server_content(interrupted=True)))
+
     def request_tool(self, call_id: str, name: str, args: dict[str, Any]) -> None:
         """Enqueue a tool call request from the server."""
         self.emit(

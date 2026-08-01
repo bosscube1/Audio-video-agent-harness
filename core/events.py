@@ -37,7 +37,7 @@ class TranscriptSource(StrEnum):
 class ConnectionStateChanged:
     state: ConnectionState
     detail: str = ""
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +45,7 @@ class PartialTranscript:
     text: str
     source: TranscriptSource
     turn_id: int = 0
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +53,7 @@ class TurnComplete:
     source: TranscriptSource
     text: str
     turn_id: int = 0
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +61,7 @@ class ToolCallReceived:
     call_id: str
     name: str
     args: dict[str, Any]
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +70,7 @@ class ToolApprovalRequested:
     name: str
     args: dict[str, Any]
     allow_text: str = ""  # one-line policy summary for headless/CLI
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,34 +80,34 @@ class ToolResultSent:
     ok: bool
     result: str
     orphaned: bool = False
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCallCancelled:
     call_ids: list[str]
     reason: str
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class SessionExpiring:
     seconds: int | None
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class AudioLevel:
     source: str  # "mic" or "speaker"
     level: float  # 0.0 - 1.0 RMS-ish envelope
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class SessionError:
     message: str
     fatal: bool = False
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +115,7 @@ class ContextReset:
     """Emitted when a reconnect could not resume and history was rebuilt."""
 
     reason: str
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +128,7 @@ class DisconnectReason:
 
     code: str
     detail: str = ""
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 USER_REQUEST = DisconnectReason("user_request")
@@ -144,7 +144,7 @@ class UsageUpdate:
     video_tokens: int = 0
     total_tokens: int = 0
     estimated_usd: float = 0.0
-    timestamp: datetime = field(default_factory=_utc_now)
+    timestamp: datetime = field(default_factory=_utc_now, compare=False)
 
 
 # Convenience union used by type hints; not instantiated.
