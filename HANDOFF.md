@@ -83,12 +83,19 @@ Phase 6 code work is done (wheel fixed, run/turn/usage persistence wired,
 PyInstaller onedir build passing its smoke test). What remains needs real
 hardware and the real API:
 
-### Manual Phase 6 gate
+### Manual Phase 6 gate — PASSED (2026-08-01)
 
-- Built exe launches on a clean path with no `.env` and no source tree,
-  prompts for the API key, completes a voice turn, and writes state under
-  `%LOCALAPPDATA%`.
-- Rebuild command: `.venv\Scripts\pyinstaller packaging\gemini-live-agent.spec --clean --noconfirm`
+- Installer ran silently; app landed in `C:\Program Files\GeminiLiveAgent` (157 MB).
+- Installed exe launched from a clean temp dir (no source tree, no `.env`) —
+  `--help` exit 0, and a **live API text turn completed**: connected, model
+  replied "hello", clean disconnect.
+- State verified under `%LOCALAPPDATA%\GeminiLiveAgent`: run row with
+  `ended_at`, persisted turn text, and non-zero usage rows (prompt 2214 /
+  completion 73 — confirms the `response_token_count` fix against the real API).
+- Uninstall silent and complete (Program Files dir removed; `%LOCALAPPDATA%`
+  state intentionally survives).
+- **Not covered:** a real *voice* turn (needs a human at the mic) and the
+  API-key prompt path (a key already exists in the credential store).
 
 ### Inno Setup installer
 
