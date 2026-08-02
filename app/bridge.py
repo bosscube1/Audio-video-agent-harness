@@ -53,6 +53,14 @@ class Bridge(QThread):
         self._journal: Journal | None = None
         self._store: Store | None = None
 
+        # Commands sent before the thread's loop exists are buffered here and
+        # drained into the queue during run(). Without this, commands fired
+        # immediately after start() — like the GUI's initial SetGatingMode —
+        # are silently dropped.
+        self._pending_lock = threading.Lock()
+        self._pending_commands: list[AgentCommand] = []
+        self._ready = False
+
         self._mic_level = 0.0
         self._speaker_level = 0.0
         self._level_lock = threading.Lock()
@@ -79,6 +87,14 @@ class Bridge(QThread):
         self._event_queue = asyncio.Queue()
         self._journal = Journal(run_id=self._run_id)
         self._store = Store()
+
+        # Flush commands that arrived before the loop existed, preserving order.
+        with self._pending_lock:
+            pending = self._pending_commands
+            self._pending_commands = []
+            self._ready = True
+        for command in pending:
+            self._command_queue.put_nowait(command)
 
         supervisor = Supervisor(
             settings=self._settings,
@@ -130,10 +146,12 @@ class Bridge(QThread):
         """Forward a command from the GUI thread to the asyncio core."""
         if self._stopped and not isinstance(command, Disconnect):
             return
-        loop = self._loop
-        queue = self._command_queue
-        if loop is None or queue is None or loop.is_closed():
-            return
+        with self._pending_lock:
+            loop = self._loop
+            queue = self._command_queue
+            if not self._ready or loop is None or queue is None or loop.is_closed():
+                self._pending_commands.append(command)
+                return
         loop.call_soon_threadsafe(queue.put_nowait, command)
 
     def stop(self) -> None:

@@ -193,3 +193,58 @@ def test_main_window_reconnects_on_go_away(
 
     window.close()
     assert not window._bridge
+
+
+def test_yolo_write_file_executes_without_approval(
+    qtbot: Any,
+    monkeypatch: Any,
+    workspace: Path,
+    patched_dirs: None,
+) -> None:
+    """End-to-end: yolo mode executes write_file with no approval card.
+
+    Covers the full chain that was broken: the GUI's SetGatingMode(YOLO) must
+    survive the bridge startup race, reach the shared policy engine, and the
+    write must land inside the session workspace.
+    """
+    live = FakeLive()
+
+    async def on_connect(session: FakeLiveSession) -> None:
+        session.request_tool(
+            "fc-yolo", "write_file", {"path": "yolo-note.txt", "content": "hello"}
+        )
+
+    live.on_connect(on_connect)
+    _patch_dependencies(monkeypatch, live)
+
+    settings = AppSettings(
+        model="gemini-3.1-flash-live-preview",
+        mode="text",
+        working_dir=workspace,
+        workspace_root=workspace,
+        share_screen=False,
+        yolo=True,
+        minimize_to_tray=False,
+    )
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+
+    qtbot.mouseClick(window._connect_btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(
+        lambda: window._status_label.text() == ConnectionState.LIVE.value,
+        timeout=5000,
+    )
+
+    # No approval card may appear; the result arrives on its own.
+    qtbot.waitUntil(
+        lambda: (workspace / "yolo-note.txt").exists(),
+        timeout=5000,
+    )
+    assert window._tool_cards == {}
+    assert (workspace / "yolo-note.txt").read_text() == "hello"
+
+    qtbot.mouseClick(window._connect_btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._connect_btn.text() == "Connect", timeout=5000)
+    window.close()

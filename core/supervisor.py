@@ -16,6 +16,7 @@ from typing import Any
 
 from google.genai import types
 
+import tools._state as tools_state
 from audit.journal import Journal
 from core.commands import AgentCommand
 from core.dispatcher import ToolDispatcher
@@ -99,22 +100,30 @@ class Supervisor:
         self._media_started = False
 
         self._turn_state = TurnState()
+        policy = PolicyEngine(
+            allow_roots=[self._settings.workspace_root],
+            deny_globs=[r"*\.git*", "__pycache__"],
+            never_allow_regex=[
+                r"AIza[0-9A-Za-z\-_]{35}",
+                r"sk-[A-Za-z0-9]{20,}",
+                r"ghp_[A-Za-z0-9]{36}",
+            ],
+        )
         self._dispatcher = ToolDispatcher(
-            policy=PolicyEngine(
-                allow_roots=[self._settings.workspace_root],
-                deny_globs=[r"*\.git*", "__pycache__"],
-                never_allow_regex=[
-                    r"AIza[0-9A-Za-z\-_]{35}",
-                    r"sk-[A-Za-z0-9]{20,}",
-                    r"ghp_[A-Za-z0-9]{36}",
-                ],
-            ),
+            policy=policy,
             journal=self._journal,
             event_queue=self._event_queue,
             run_id=self._run_id,
             epoch=self._epoch,
             store=self._store,
         )
+
+        # The tool implementations keep their own module-level policy as a
+        # safety net. Point it at the *same* engine and the session workspace,
+        # otherwise it evaluates against the process cwd captured at import
+        # time (wrong root for every write) and never sees gating-mode changes.
+        tools_state.set_policy(policy)
+        tools_state.set_workspace(self._settings.workspace_root)
 
     async def run(self) -> DisconnectReason:
         """Run the main reconnect loop until the user disconnects or we fail."""

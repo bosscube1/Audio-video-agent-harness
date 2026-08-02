@@ -111,6 +111,49 @@ def _prompt_for_api_key() -> None:
     set_api_key(key)
 
 
+def _default_workspace() -> Path:
+    """User-writable default workspace for the installed app."""
+    workspace = Path.home() / "Documents" / "GeminiLiveAgent"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def _resolve_working_dir(raw: str) -> Path:
+    """Resolve the --working-dir argument into a usable workspace path.
+
+    When running as a frozen (PyInstaller) exe, the process cwd is typically
+    the install directory under Program Files — unwritable for standard users
+    and marked immutable by the policy engine. Default to a Documents
+    workspace in that case.
+    """
+    if raw != ".":
+        return Path(raw)
+    if getattr(sys, "frozen", False):
+        return _default_workspace()
+    return Path(raw)
+
+
+def _guard_frozen_workspace(settings: AppSettings) -> AppSettings:
+    """Redirect a persisted workspace that points at the install directory.
+
+    Older builds persisted working_dir=<Program Files install dir> into
+    settings.json on first connect; loading that would re-break file writes.
+    """
+    if not getattr(sys, "frozen", False):
+        return settings
+    exe_dir = Path(sys.executable).resolve().parent
+    try:
+        under_exe = settings.working_dir.resolve().is_relative_to(exe_dir)
+    except OSError:  # pragma: no cover - defensive
+        under_exe = False
+    if not under_exe:
+        return settings
+    workspace = _default_workspace()
+    return settings.model_copy(
+        update={"working_dir": workspace, "workspace_root": workspace}
+    )
+
+
 def main() -> int:
     """Parse args, build settings, ensure an API key, and run the agent."""
     args = parse_args()
@@ -119,7 +162,7 @@ def main() -> int:
     if args.headless and get_api_key() is None:
         _prompt_for_api_key()
 
-    working_dir = Path(args.working_dir)
+    working_dir = _resolve_working_dir(args.working_dir)
 
     settings = AppSettings.load(
         mode=args.mode,
@@ -134,6 +177,7 @@ def main() -> int:
         headless=args.headless,
         debug=args.debug,
     )
+    settings = _guard_frozen_workspace(settings)
 
     if settings.headless:
         return asyncio.run(run_headless(settings))

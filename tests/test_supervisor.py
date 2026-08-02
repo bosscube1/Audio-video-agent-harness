@@ -608,3 +608,52 @@ async def test_run_lifecycle_turns_and_usage_persisted(
     by_modality = {modality: tokens for modality, tokens, _usd, _at in usage}
     assert by_modality.get("prompt") == 100
     assert by_modality.get("completion") == 20
+
+
+@pytest.mark.asyncio
+async def test_supervisor_syncs_tools_state_and_yolo_allows_writes(
+    settings: AppSettings,
+    command_queue: asyncio.Queue[Any],
+    event_queue: asyncio.Queue[Any],
+    journal: Journal,
+    store: Store,
+    workspace: Path,
+) -> None:
+    """The tools' module-level policy must follow the session workspace/mode.
+
+    Regression: tools._state used to evaluate against the process cwd captured
+    at import time, so write_file resolved into the wrong directory (or was
+    denied outright), and its engine never received yolo mode.
+    """
+    import tools._state as tools_state
+    import tools.fs as fs_tools
+    from core.commands import GatingMode
+    from policy.engine import DecisionKind
+    from tools.registry import WriteFileArgs
+
+    supervisor = Supervisor(
+        settings=settings,
+        command_queue=command_queue,
+        event_queue=event_queue,
+        journal=journal,
+        store=store,
+        run_id="sync-test",
+    )
+
+    # The safety-net policy now shares the dispatcher's engine and workspace.
+    assert tools_state._workspace_root == workspace
+    args = WriteFileArgs(path="note.txt", content="hello")
+
+    # Guarded mode: the shared engine asks for confirmation on writes.
+    decision = tools_state._policy.evaluate("write_file", args)
+    assert decision.kind == DecisionKind.CONFIRM
+
+    # Yolo mode propagates to the same engine: no confirmation required.
+    supervisor._dispatcher.set_gating_mode(GatingMode.YOLO)
+    decision = tools_state._policy.evaluate("write_file", args)
+    assert decision.kind == DecisionKind.ALLOW
+
+    # And a direct write lands inside the session workspace, not the cwd.
+    result = fs_tools.write_file(args)
+    assert result.ok
+    assert (workspace / "note.txt").read_text() == "hello"
