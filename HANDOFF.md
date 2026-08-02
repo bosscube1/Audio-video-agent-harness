@@ -5,9 +5,36 @@
 - **Repository:** `C:\Users\Hp\projects\gemini-live-agent`
 - **Remote:** `https://github.com/bosscube1/Audio-video-agent-harness.git`
 - **Branch:** `Kimi-V2`
-- **Latest commit:** *(update after next commit)* — Phase 5 GUI control surfaces & voice UX
-- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption / barge-in), 4 (GUI shell on a QThread), 5 (GUI control surfaces + voice UX polish), 6 (persistence wiring + packaging)
+- **Latest commit:** `c7d622d` — production-readiness fixes (file creation + yolo gating)
+- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption / barge-in), 4 (GUI shell on a QThread), 5 (GUI control surfaces + voice UX polish), 6 (persistence wiring + packaging), /goal production fixes (2026-08-01)
 - **Next:** manual Phase 6 gate with real hardware (see below), then cut-list candidates
+
+## /goal production fixes (2026-08-01, commit `c7d622d`)
+
+Two production blockers reported against the installed build, traced to three defects:
+
+1. **Yolo mode still prompted in the GUI.** `Bridge.send_command` silently
+   returned while the QThread's asyncio loop didn't exist yet, dropping the
+   `SetGatingMode(YOLO)` the GUI fires right after `start()`. Commands are now
+   buffered under a lock and drained into the queue when `run()` starts.
+   Headless was unaffected.
+2. **File creation failed everywhere.** Tool implementations evaluated a
+   module-level policy/workspace in `tools/_state.py` captured from process
+   cwd at import time — never synced to the session workspace or gating mode.
+   `Supervisor.__init__` now shares its `PolicyEngine` with `tools._state`
+   (`set_policy` / `set_workspace`).
+3. **Frozen installs couldn't write.** The installed exe's cwd is
+   `C:\Program Files\GeminiLiveAgent`, which is also in the policy's
+   `_immutable_dirs()` via `sys.executable.parent` — every write denied.
+   `main.py` now defaults frozen apps to `~/Documents/GeminiLiveAgent`
+   (`_default_workspace` / `_resolve_working_dir`) and redirects a persisted
+   install-dir workspace from `settings.json` (`_guard_frozen_workspace`).
+
+Regression tests: `tests/test_gui_bridge.py` (command buffering),
+`tests/test_supervisor.py` (tools-state sync + yolo write without approval),
+`tests/test_gui_lifecycle.py` (yolo write end-to-end), `tests/test_main_entry.py`
+(6 tests for the frozen-workspace helpers). Full suite: 73 passed, ruff/mypy
+clean. Rebuilt and silently reinstalled to `C:\Program Files\GeminiLiveAgent`.
 
 ## Phase 6 additions
 
