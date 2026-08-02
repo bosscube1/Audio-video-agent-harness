@@ -271,6 +271,19 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self._system_prompt_edit, row, 1)
 
         row += 1
+        self._wake_word_check = QCheckBox("Wake-word gating (voice)")
+        self._wake_word_edit = QLineEdit()
+        self._wake_word_edit.setPlaceholderText("e.g. Bongo")
+        self._wake_word_edit.setAccessibleName("Wake word")
+        self._wake_word_edit.setMaximumWidth(180)
+        wake_layout = QHBoxLayout()
+        wake_layout.addWidget(self._wake_word_check)
+        wake_layout.addWidget(QLabel("Wake word:"))
+        wake_layout.addWidget(self._wake_word_edit)
+        wake_layout.addStretch()
+        settings_layout.addLayout(wake_layout, row, 0, 1, 2)
+
+        row += 1
         self._working_dir_edit = QLineEdit()
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._on_browse_working_dir)
@@ -399,6 +412,8 @@ class MainWindow(QMainWindow):
         self._yolo_check.setChecked(self._settings.yolo)
         self._tray_check.setChecked(self._settings.minimize_to_tray)
         self._system_prompt_edit.setPlainText(self._settings.system_prompt)
+        self._wake_word_check.setChecked(self._settings.wake_word_enabled)
+        self._wake_word_edit.setText(self._settings.wake_word)
         self._working_dir_edit.setText(str(self._settings.working_dir))
         if self._settings.input_device:
             self._input_device_combo.setCurrentText(self._settings.input_device)
@@ -423,6 +438,8 @@ class MainWindow(QMainWindow):
             yolo=self._yolo_check.isChecked(),
             minimize_to_tray=self._tray_check.isChecked(),
             system_prompt=self._system_prompt_edit.toPlainText().strip(),
+            wake_word_enabled=self._wake_word_check.isChecked(),
+            wake_word=self._wake_word_edit.text().strip() or "Bongo",
             headless=False,
             debug=self._settings.debug,
         )

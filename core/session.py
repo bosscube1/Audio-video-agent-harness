@@ -39,12 +39,15 @@ from core.events import (
     ConnectionState,
     ConnectionStateChanged,
     DisconnectReason,
+    PartialTranscript,
     SessionError,
     SessionExpiring,
+    TranscriptSource,
     TurnComplete,
     UsageUpdate,
 )
 from core.turn_state import TurnState
+from core.wake_word import contains_wake_word
 from media import devices
 from media.microphone import INPUT_SAMPLE_RATE, Microphone
 from media.screen import ScreenCapture
@@ -161,6 +164,15 @@ class LiveSession:
         self._video_send_task: asyncio.Task[Any] | None = None
         self._shutdown_event = asyncio.Event()
         self._mic_gate_open = True
+
+        # Wake-word gating state. ``_utterance_text`` accumulates the current
+        # voice utterance's input transcription; when the model starts a turn
+        # we decide once whether that utterance addressed us. Typed SendText
+        # turns are always in scope and exempt via ``_text_turn_pending``.
+        self._utterance_text = ""
+        self._text_turn_pending = False
+        self._turn_evaluated = False
+        self._turn_gated = False
 
     async def run(self) -> DisconnectReason:
         """Connect to the API, spawn loops, and return when the session ends."""
@@ -330,6 +342,44 @@ class LiveSession:
         finally:
             await self._stop_media()
 
+    def _update_wake_gate(self, server_content: Any) -> bool:
+        """Update wake-word gating from a server content chunk.
+
+        Returns True only on the chunk that first triggers the gate, so the
+        caller can flush playback and surface an activity event exactly once
+        per gated turn. No-op when wake-word gating is disabled.
+        """
+        if not self._settings.wake_word_enabled:
+            return False
+
+        input_transcription = server_content.input_transcription
+        if input_transcription and input_transcription.text:
+            self._utterance_text += input_transcription.text
+
+        has_model_output = bool(
+            (server_content.model_turn and server_content.model_turn.parts)
+            or (
+                server_content.output_transcription
+                and server_content.output_transcription.text
+            )
+        )
+        if has_model_output and not self._turn_evaluated:
+            self._turn_evaluated = True
+            addressed = self._text_turn_pending or contains_wake_word(
+                self._utterance_text, self._settings.wake_word
+            )
+            if not addressed:
+                self._turn_gated = True
+                return True
+        return False
+
+    def _reset_wake_gate(self) -> None:
+        """Clear per-turn gating state at a turn boundary."""
+        self._utterance_text = ""
+        self._text_turn_pending = False
+        self._turn_evaluated = False
+        self._turn_gated = False
+
     async def _receive_loop(self, session: Any) -> DisconnectReason | None:
         """Consume server responses and dispatch side effects.
 
@@ -366,6 +416,22 @@ class LiveSession:
 
                     server_content = response.server_content
                     if server_content:
+                        # Wake-word gate: a voice turn that never addressed us
+                        # must produce no audio, no transcript, no tool calls.
+                        if self._update_wake_gate(server_content):
+                            if self._speaker is not None:
+                                self._speaker.flush()
+                            await self._emit(
+                                SessionError(
+                                    message=(
+                                        "wake-word gate: ignored speech without "
+                                        f"'{self._settings.wake_word}'"
+                                    ),
+                                    fatal=False,
+                                )
+                            )
+                        gated = self._turn_gated
+
                         # Barge-in: the server detected user speech and aborted
                         # the model turn. Kill queued playback first, before any
                         # other handling, so the model stops mid-sentence rather
@@ -375,6 +441,12 @@ class LiveSession:
 
                         events = self._turn_state.consume_server_content(server_content)
                         for event in events:
+                            if (
+                                gated
+                                and isinstance(event, (PartialTranscript, TurnComplete))
+                                and event.source == TranscriptSource.MODEL
+                            ):
+                                continue  # gated turn: no agent transcript bubble
                             await self._emit(event)
                             if isinstance(event, TurnComplete):
                                 completed_at = datetime.now(UTC).isoformat()
@@ -392,16 +464,25 @@ class LiveSession:
 
                         # Play audio contained in the model turn.
                         model_turn = server_content.model_turn
-                        if model_turn and model_turn.parts and self._speaker is not None:
+                        if (
+                            not gated
+                            and model_turn
+                            and model_turn.parts
+                            and self._speaker is not None
+                        ):
                             for part in model_turn.parts:
                                 inline_data = getattr(part, "inline_data", None)
                                 if inline_data and inline_data.data:
                                     self._speaker.write(inline_data.data)
 
+                        if server_content.turn_complete or server_content.interrupted:
+                            self._reset_wake_gate()
+
                     # Tool calls are handled off the receive path so approvals and
-                    # blocking operations cannot stall message handling.
+                    # blocking operations cannot stall message handling. A gated
+                    # (unaddressed) turn must never dispatch tools.
                     tool_call = response.tool_call
-                    if tool_call and tool_call.function_calls:
+                    if tool_call and tool_call.function_calls and not self._turn_gated:
                         for fc in tool_call.function_calls:
                             if self._dispatcher is not None:
                                 asyncio.create_task(
@@ -487,6 +568,9 @@ class LiveSession:
                         ],
                         turn_complete=True,
                     )
+                    # Typed input is always addressed to the agent, so the next
+                    # model turn is exempt from wake-word gating.
+                    self._text_turn_pending = True
 
                 elif isinstance(cmd, SetMicGate):
                     self._mic_gate_open = cmd.open

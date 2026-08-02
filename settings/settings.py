@@ -60,6 +60,38 @@ When the user says "this", "that", "here," or asks what they are looking at, \
 check the screen feed before asking them to describe it. The feed updates at a \
 low frame rate, so it may lag a moment behind their actions."""
 
+_WAKE_WORD_TEMPLATE = """
+## Wake-Word Gating (STRICT)
+
+You are a voice assistant running on the user's machine with access to tools \
+that can read files, run commands, and control the system — so precision about \
+when to act matters as much as what you do.
+
+- You are always listening, but you only RESPOND when your wake word \
+"{wake_word}" appears in the transcribed voice input, OR the input arrived as \
+typed text (not voice).
+- Voice transcripts that do NOT contain the wake word are background \
+conversation, not directed at you. Do not respond, do not call tools, do not \
+acknowledge them. Treat them as silence: no audio output, no tool calls, no \
+text reply.
+- The wake word can appear anywhere in the utterance ("hey {wake_word}, \
+what's...", "...can you check that, {wake_word}"). It may be slightly \
+mistranscribed by speech recognition; use context to judge.
+- After you finish responding to a wake-word-triggered request, return to \
+silent listening. Do not assume follow-up utterances are still directed at \
+you unless they also contain the wake word — you cannot see who is in the \
+room, so voice conversations carry no implicit addressing across turns.
+- If voice input is ambiguous (wake word possibly mistranscribed, or unclear \
+whether directed at you), stay silent. False negatives (staying quiet when \
+addressed) are far cheaper than false positives (interrupting a conversation \
+you were not part of).
+- Never treat a third-person mention of your name ("ask {wake_word} about X" \
+said to someone else) as a command. The wake word with no actionable request \
+after it means ignore, or at most a minimal acknowledgment.
+- Typed/text input is always in scope — no wake word needed there, since the \
+user deliberately typed to you.
+"""
+
 
 class AppSettings(BaseSettings):
     """Runtime configuration for the Gemini Live Agent."""
@@ -90,6 +122,9 @@ class AppSettings(BaseSettings):
     minimize_to_tray: bool = True
     # Extra instructions appended to the built-in system prompt. Empty = default.
     system_prompt: str = ""
+    # Wake-word gating: voice input is ignored unless it contains the wake word.
+    wake_word_enabled: bool = False
+    wake_word: str = "Bongo"
 
     @field_validator("voice")
     @classmethod
@@ -114,6 +149,18 @@ class AppSettings(BaseSettings):
             msg = f"screen_fps must be greater than 0 (got {value})"
             raise ValueError(msg)
         return value
+
+    @field_validator("wake_word")
+    @classmethod
+    def _validate_wake_word(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _validate_wake_word_enabled(self) -> AppSettings:
+        if self.wake_word_enabled and not self.wake_word:
+            msg = "wake_word must not be empty when wake_word_enabled is set"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _resolve_and_validate_paths(self) -> AppSettings:
@@ -202,6 +249,8 @@ class AppSettings(BaseSettings):
             instruction_text += (
                 "\n## Additional Instructions\n" + self.system_prompt.strip() + "\n"
             )
+        if self.wake_word_enabled:
+            instruction_text += _WAKE_WORD_TEMPLATE.format(wake_word=self.wake_word)
 
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
