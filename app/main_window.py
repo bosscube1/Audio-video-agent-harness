@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.bridge import Bridge
+from app.theme import DANGER, MAIN_QSS, SUCCESS, TEXT_MUTED, apply_glass_shadow
 from core.commands import (
     ApproveTool,
     CancelTool,
@@ -92,9 +93,9 @@ class _MicState(StrEnum):
 
 
 _MIC_CHIP_STYLES = {
-    _MicState.OFF: "color: #888;",
-    _MicState.LIVE: "color: #2e7d32; font-weight: bold;",
-    _MicState.MUTED: "color: #c62828; font-weight: bold;",
+    _MicState.OFF: f"color: {TEXT_MUTED};",
+    _MicState.LIVE: f"color: {SUCCESS}; font-weight: bold;",
+    _MicState.MUTED: f"color: {DANGER}; font-weight: bold;",
 }
 
 _MIC_CHIP_TEXT = {
@@ -110,8 +111,10 @@ class _ToolCard(QFrame):
     def __init__(self, event: ToolApprovalRequested, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.call_id = event.call_id
+        self.setObjectName("glassCard")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setAccessibleName(f"Tool approval request: {event.name}")
+        apply_glass_shadow(self, blur=18, dy=4)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(4)
@@ -173,6 +176,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("centralRoot")
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(8)
@@ -180,10 +184,12 @@ class MainWindow(QMainWindow):
         # Status bar + mic state chip + connect button
         top_layout = QHBoxLayout()
         self._status_label = QLabel("Disconnected")
+        self._status_label.setObjectName("statusChip")
         self._mic_chip = QLabel(_MIC_CHIP_TEXT[_MicState.OFF])
         self._mic_chip.setStyleSheet(_MIC_CHIP_STYLES[_MicState.OFF])
         self._mic_chip.setAccessibleName("Microphone state")
         self._connect_btn = QPushButton("Connect")
+        self._connect_btn.setObjectName("accentButton")
         self._connect_btn.clicked.connect(self._on_connect_clicked)
         top_layout.addWidget(self._status_label)
         top_layout.addWidget(self._mic_chip)
@@ -193,6 +199,8 @@ class MainWindow(QMainWindow):
 
         # Settings panel
         self._settings_widget = QWidget()
+        self._settings_widget.setObjectName("glassPanel")
+        apply_glass_shadow(self._settings_widget)
         settings_layout = QGridLayout(self._settings_widget)
         settings_layout.setSpacing(6)
         main_layout.addWidget(self._settings_widget)
@@ -264,9 +272,7 @@ class MainWindow(QMainWindow):
 
         # Screen-share indicator banner (visible only while sharing + connected)
         self._share_banner = QLabel("● Sharing screen — the model can see your screen")
-        self._share_banner.setStyleSheet(
-            "color: #b71c1c; font-weight: bold; padding: 2px;"
-        )
+        self._share_banner.setObjectName("shareBanner")
         self._share_banner.setAccessibleName("Screen sharing indicator")
         self._share_banner.setVisible(False)
         main_layout.addWidget(self._share_banner)
@@ -290,6 +296,7 @@ class MainWindow(QMainWindow):
         self._tool_scroll = QScrollArea()
         self._tool_scroll.setWidgetResizable(True)
         self._tool_container = QWidget()
+        self._tool_container.setObjectName("toolContainer")
         self._tool_layout = QVBoxLayout(self._tool_container)
         self._tool_layout.addStretch()
         self._tool_scroll.setWidget(self._tool_container)
@@ -753,6 +760,7 @@ class MainWindow(QMainWindow):
 def run_gui(settings: AppSettings) -> int:
     """Create the QApplication, prompt for an API key if needed, and run the GUI."""
     app = QApplication(sys.argv)
+    app.setStyleSheet(MAIN_QSS)
 
     if get_api_key() is None:
         key, ok = QInputDialog.getText(

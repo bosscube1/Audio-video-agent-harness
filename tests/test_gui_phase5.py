@@ -349,3 +349,30 @@ def test_tool_card_buttons_have_mnemonics(
     qtbot.mouseClick(window._connect_btn, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: window._connect_btn.text() == "Connect", timeout=5000)
     window.close()
+
+
+# -- Theme --
+
+
+def test_theme_stylesheet_and_object_names(
+    qtbot: Any, settings: AppSettings, patched_dirs: None
+) -> None:
+    """The navy/cyan glass theme is wired to the expected widgets."""
+    from app.theme import MAIN_QSS
+
+    # Palette sanity: navy base + cyan accent + glass fill present.
+    assert "#0A1430" in MAIN_QSS
+    assert "#22D3EE" in MAIN_QSS
+    assert "rgba(148, 197, 255, 0.07)" in MAIN_QSS
+
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    assert window._settings_widget.objectName() == "glassPanel"
+    assert window._connect_btn.objectName() == "accentButton"
+    assert window._status_label.objectName() == "statusChip"
+    assert window._share_banner.objectName() == "shareBanner"
+    assert window._tool_container.objectName() == "toolContainer"
+    # The central widget must stay transparent so the window gradient shows.
+    assert window.centralWidget().objectName() == "centralRoot"
+    window.close()
