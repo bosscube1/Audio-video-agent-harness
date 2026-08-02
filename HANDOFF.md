@@ -93,15 +93,16 @@ hardware and the real API:
 ### Inno Setup installer
 
 `packaging/installer.iss` is drafted (per-machine install under Program Files,
-Start Menu + optional desktop shortcut, post-install launch). To produce the
-installer, install Inno Setup 6 and run:
+Start Menu + optional desktop shortcut, post-install launch) and **compile-tested**:
+Inno Setup 6.7.3 produces `dist\installer\gemini-live-agent-setup-0.2.0.exe`
+(50 MB) in ~40 s. To rebuild:
 
 ```
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
 ```
 
-Output lands in `dist\installer\gemini-live-agent-setup-0.2.0.exe`. Inno Setup
-is not installed on this machine yet, so the script has not been compile-tested.
+The installer itself has not been executed yet (installing to Program Files is
+part of the manual Phase 6 gate below).
 
 ### Live wall tests still pending
 
