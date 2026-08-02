@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -28,25 +27,18 @@ from tests.fakes.fake_live import FakeLive, make_fake_client_factory
 
 
 class _StubStream:
-    """Minimal stand-in for ``sd.RawOutputStream``."""
+    """Minimal stand-in for a callback ``sd.RawOutputStream``."""
 
     def __init__(self) -> None:
-        self.written: list[bytes] = []
-        self.aborts = 0
         self.starts = 0
+        self.stops = 0
         self.closes = 0
-
-    def write(self, chunk: bytes) -> None:
-        self.written.append(chunk)
-
-    def abort(self) -> None:
-        self.aborts += 1
 
     def start(self) -> None:
         self.starts += 1
 
     def stop(self) -> None:
-        pass
+        self.stops += 1
 
     def close(self) -> None:
         self.closes += 1
@@ -83,63 +75,78 @@ class RecordingSpeaker:
 
 
 # ----------------------------------------------------------------------
-# Speaker.flush
+# Speaker.flush / callback
 # ----------------------------------------------------------------------
 
 
-def test_flush_drops_queued_audio_and_resets_the_stream() -> None:
-    """Queued chunks are discarded and the device buffer is aborted."""
+def _drain_callback(speaker: Speaker, frames: int) -> bytearray:
+    """Invoke the PortAudio callback once and return the buffer it filled."""
+    out = bytearray(b"\xff" * frames * 2)  # sentinel: must be fully overwritten
+    speaker._audio_callback(out, frames, None, None)
+    return out
+
+
+def test_callback_plays_queued_audio_and_pads_silence() -> None:
+    """Queued chunks fill the callback buffer; underrun pads with zeros."""
+    speaker = Speaker(stream_factory=lambda **_kw: _StubStream())
+    speaker._active = True
+
+    speaker.write(b"\x01\x00" * 40)  # 80 bytes = 40 frames
+    out = _drain_callback(speaker, frames=64)
+
+    assert bytes(out[:80]) == b"\x01\x00" * 40
+    assert bytes(out[80:]) == b"\x00" * 48  # silence for the remaining 24 frames
+
+
+def test_callback_splits_a_large_chunk_across_periods() -> None:
+    """A chunk bigger than one callback period is consumed piece by piece."""
+    speaker = Speaker(stream_factory=lambda **_kw: _StubStream())
+    speaker._active = True
+
+    speaker.write(b"\x02\x00" * 100)  # 100 frames
+    first = _drain_callback(speaker, frames=64)
+    second = _drain_callback(speaker, frames=64)
+
+    assert bytes(first) == b"\x02\x00" * 64
+    assert bytes(second[:72]) == b"\x02\x00" * 36  # remaining 36 frames
+    assert bytes(second[72:]) == b"\x00" * 56  # then silence
+
+
+def test_flush_drops_queued_audio_and_pending_remainder() -> None:
+    """After flush, the callback emits silence — without touching the stream."""
     stream = _StubStream()
-    created = [stream]
-
-    def factory(**_kwargs: Any) -> _StubStream:
-        new = _StubStream()
-        created.append(new)
-        return new
-
-    speaker = Speaker(stream_factory=factory)
+    speaker = Speaker(stream_factory=lambda **_kw: stream)
     speaker._stream = stream
     speaker._active = True
 
     speaker.write(b"\x01\x00" * 100)
+    _drain_callback(speaker, frames=16)  # leave a pending remainder
     speaker.write(b"\x02\x00" * 100)
-    assert speaker._queue.qsize() == 2
 
     speaker.flush()
 
     assert speaker._queue.qsize() == 0
-    # The old stream is aborted and closed, and a fresh stream is opened for
-    # the next turn (recreating avoids Windows MME errors restarting the same
-    # aborted stream).
-    assert stream.aborts == 1
-    assert stream.closes == 1
-    assert len(created) == 2
-    assert created[1].starts == 1
-    assert speaker._stream is created[1]
+    assert speaker._pending == b""
+    out = _drain_callback(speaker, frames=64)
+    assert bytes(out) == b"\x00" * 128
+    # The stream is never aborted/closed/recreated on flush.
+    assert stream.closes == 0
+    assert stream.stops == 0
     assert speaker.level == 0.0
 
 
-def test_writer_discards_chunks_queued_before_a_flush() -> None:
-    """A chunk that survives the drain is still dropped by its generation tag."""
-    stream = _StubStream()
-
-    def factory(**_kwargs: Any) -> _StubStream:
-        return _StubStream()
-
-    speaker = Speaker(stream_factory=factory)
-    speaker._stream = stream
+def test_callback_discards_chunks_queued_before_a_flush() -> None:
+    """A chunk queued after the drain but tagged pre-flush is still dropped."""
+    speaker = Speaker(stream_factory=lambda **_kw: _StubStream())
     speaker._active = True
 
-    stale = (speaker._generation, b"\x01\x00" * 100)
     speaker.flush()
-    # Re-queue a chunk tagged with the pre-flush generation, as an in-flight
-    # write() racing the flush would do.
-    speaker._queue.put(stale)
-    speaker._queue.put(None)
+    # Re-queue a chunk tagged with the pre-flush generation, as a racing
+    # write() would produce.
+    speaker._queue.put((speaker._generation - 1, b"\x01\x00" * 100))
 
-    speaker._writer()
-
-    assert stream.written == []
+    out = _drain_callback(speaker, frames=64)
+    assert bytes(out) == b"\x00" * 128
 
 
 def test_flush_is_a_noop_when_the_speaker_is_not_running() -> None:
@@ -148,71 +155,20 @@ def test_flush_is_a_noop_when_the_speaker_is_not_running() -> None:
     assert speaker._queue.qsize() == 0
 
 
-def test_flush_survives_a_stream_that_fails_to_abort() -> None:
-    """A device error during flush must not take the speaker down."""
+def test_start_passes_a_low_latency_callback_stream() -> None:
+    """The stream factory receives the callback and low-latency settings."""
+    captured: dict[str, Any] = {}
 
-    class _AngryStream(_StubStream):
-        def abort(self) -> None:
-            raise RuntimeError("device gone")
-
-    def factory(**_kwargs: Any) -> _StubStream:
+    def factory(**kwargs: Any) -> _StubStream:
+        captured.update(kwargs)
         return _StubStream()
 
     speaker = Speaker(stream_factory=factory)
-    speaker._stream = _AngryStream()
-    speaker._active = True
-    speaker.write(b"\x01\x00" * 100)
+    asyncio.run(speaker.start())
 
-    speaker.flush()
-
-    assert speaker._queue.qsize() == 0
-    assert speaker._stream is not None  # fresh stream recreated despite the error
-
-
-def test_flush_waits_for_an_in_flight_write() -> None:
-    """flush() must not abort/close the stream while the writer is mid-write.
-
-    Regression test: closing an MME stream during a concurrent write corrupts
-    native PortAudio state and can kill the process without a traceback.
-    """
-    write_started = threading.Event()
-    release_write = threading.Event()
-    order: list[str] = []
-
-    class _SlowStream(_StubStream):
-        def write(self, chunk: bytes) -> None:
-            order.append("write_start")
-            write_started.set()
-            release_write.wait(timeout=5)
-            order.append("write_end")
-
-        def close(self) -> None:
-            order.append("close")
-            super().close()
-
-    stream = _SlowStream()
-    speaker = Speaker(stream_factory=lambda **_kw: _StubStream())
-    speaker._stream = stream
-    speaker._active = True
-    speaker._thread = threading.Thread(target=speaker._writer, daemon=True)
-    speaker._thread.start()
-
-    speaker.write(b"\x01\x00" * 100)
-    assert write_started.wait(timeout=2)
-
-    flush_thread = threading.Thread(target=speaker.flush, daemon=True)
-    flush_thread.start()
-    # Give flush() every chance to race ahead; it must stay blocked.
-    flush_thread.join(timeout=0.2)
-    assert "close" not in order
-
-    release_write.set()
-    flush_thread.join(timeout=5)
-    assert order.index("close") > order.index("write_end")
-
-    speaker._active = False
-    speaker._queue.put(None)
-    speaker._thread.join(timeout=2)
+    assert captured["samplerate"] == 24_000
+    assert captured["latency"] == "low"
+    assert captured["callback"] == speaker._audio_callback
 
 
 # ----------------------------------------------------------------------

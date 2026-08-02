@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import array
-import contextlib
 import math
 import queue
 import threading
@@ -19,23 +18,28 @@ logger = get_logger(__name__)
 OUTPUT_SAMPLE_RATE = 24_000  # Hz
 CHANNELS = 1
 DTYPE = "int16"
+_BYTES_PER_FRAME = CHANNELS * 2  # int16
 
 
 class Speaker:
     """Plays 24 kHz 16-bit mono PCM audio through the selected speaker.
 
-    Playback runs on a dedicated writer thread so that ``write()`` never blocks
-    the async event loop. A monotonic generation counter protects ``flush()``
-    from races with queued ``write()`` calls: after ``flush()`` increments the
-    generation, queued chunks tagged with the old generation are discarded by
-    the writer.
+    The stream is a *callback* (pull) stream: PortAudio calls
+    ``_audio_callback`` on its own real-time thread whenever it needs more
+    frames, and the callback drains a queue of PCM chunks. There is no writer
+    thread and no blocking ``stream.write()`` call anywhere.
 
-    Thread-safety: ``self._lock`` serializes *all* stream access. The writer
-    holds it for the whole check+write, and ``flush()``/``stop()`` hold it for
-    the whole abort/close/recreate, so the native PortAudio stream is never
-    torn down while another thread is inside ``stream.write()`` — closing an
-    MME stream mid-write is a use-after-free that can kill the process without
-    a Python traceback.
+    That design is what makes barge-in both instant and safe: ``flush()`` only
+    bumps a generation counter and drops queued audio, so playback goes silent
+    within one callback period. The stream itself is never aborted, closed, or
+    recreated mid-conversation, which avoids the Windows MME errors ("wave
+    header not prepared", "media data is still playing") and the native
+    crash that tearing a stream down mid-write could cause.
+
+    Thread-safety: the callback only reads ``self._generation`` and swaps
+    ``self._pending`` via atomic (GIL-protected) assignments; ``flush()`` may
+    run on the asyncio thread. Worst case, one stale chunk plays out after a
+    flush — a few tens of milliseconds.
     """
 
     def __init__(
@@ -52,10 +56,10 @@ class Speaker:
         self._stream_factory = stream_factory
         self._stream: Any | None = None
         self._active = False
-        self._queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
-        self._thread: threading.Thread | None = None
+        self._queue: queue.Queue[tuple[int, bytes]] = queue.Queue()
         self._lock = threading.Lock()
         self._generation = 0
+        self._pending = b""  # unconsumed remainder of the current chunk
 
         self._last_level = 0.0
         self._level_lock = threading.Lock()
@@ -63,42 +67,34 @@ class Speaker:
     # -- Public API --
 
     async def start(self) -> None:
-        """Open the speaker output stream and start the writer thread."""
+        """Open the speaker output stream; PortAudio pulls audio via callback."""
         self._stream = self._stream_factory(
             samplerate=OUTPUT_SAMPLE_RATE,
             channels=CHANNELS,
             dtype=DTYPE,
             device=self._device_index,
+            latency="low",
+            callback=self._audio_callback,
         )
         self._stream.start()
         self._active = True
-        self._thread = threading.Thread(target=self._writer, daemon=True)
-        self._thread.start()
         logger.info("[SPK] Speaker active")
 
     async def stop(self) -> None:
-        """Stop the writer thread and close the speaker output stream."""
+        """Stop and close the speaker output stream."""
         if self._stream is None:
             return
 
         self._active = False
-        self._queue.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            self._thread = None
-
-        # Take the lock so a write that outlived the join finishes before the
-        # stream is stopped and closed underneath it.
-        with self._lock:
-            try:
-                self._stream.stop()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Speaker stop failed: %s", exc)
-            try:
-                self._stream.close()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Speaker close failed: %s", exc)
-            self._stream = None
+        try:
+            self._stream.stop()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Speaker stop failed: %s", exc)
+        try:
+            self._stream.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Speaker close failed: %s", exc)
+        self._stream = None
         logger.info("[SPK] Speaker stopped")
 
     def write(self, pcm_bytes: bytes) -> None:
@@ -114,49 +110,18 @@ class Speaker:
     def flush(self) -> None:
         """Drop all pending audio immediately, e.g. on barge-in.
 
-        Draining the queue alone is not enough to stop the model mid-sentence:
-        PortAudio has already buffered whatever was handed to ``write()``. We
-        abort the current stream, close it, and open a fresh one for the next
-        turn. On Windows MME, restarting an aborted stream often fails with
-        "media data is still playing", so we always recreate the stream
-        instead.
-
-        The whole teardown runs under ``self._lock``, which the writer thread
-        also holds for the duration of its ``stream.write()`` call. An
-        in-flight write therefore finishes before the stream is aborted and
-        closed — tearing the stream down mid-write corrupts the native MME
-        state and can crash the process outright.
+        The generation bump makes the callback discard every queued chunk and
+        the partially consumed remainder, so the stream falls silent within
+        one callback period — no abort/close/recreate of the native stream.
         """
+        with self._lock:
+            self._generation += 1
+        self._pending = b""
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
-
-        with self._lock:
-            self._generation += 1
-            stream = self._stream
-            if stream is None or not self._active:
-                return
-
-            with contextlib.suppress(Exception):
-                stream.abort()
-            with contextlib.suppress(Exception):
-                stream.close()
-
-            try:
-                new_stream = self._stream_factory(
-                    samplerate=OUTPUT_SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype=DTYPE,
-                    device=self._device_index,
-                )
-                new_stream.start()
-                self._stream = new_stream
-            except Exception as exc:  # pragma: no cover - device dependent
-                logger.warning("Speaker stream recreate after flush failed: %s", exc)
-                self._stream = None
-
         with self._level_lock:
             self._last_level = 0.0
         logger.info("[SPK] Playback flushed (barge-in)")
@@ -172,28 +137,31 @@ class Speaker:
         with self._level_lock:
             return self._last_level
 
-    # -- Writer thread --
+    # -- PortAudio callback (real-time thread; never blocks) --
 
-    def _writer(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:  # sentinel
-                return
+    def _audio_callback(self, outdata: Any, frames: int, _time: Any, status: Any) -> None:
+        """Fill ``outdata`` with queued PCM, or silence when nothing is queued."""
+        if status:
+            logger.warning("Speaker callback status: %s", status)
 
-            generation, chunk = item
-            # Hold the lock for the whole check+write so flush()/stop() cannot
-            # tear the stream down mid-write.
-            with self._lock:
-                if (
-                    not self._active
-                    or generation != self._generation
-                    or self._stream is None
-                ):
-                    continue
+        need = frames * _BYTES_PER_FRAME
+        pos = 0
+        while pos < need:
+            if not self._pending:
                 try:
-                    self._stream.write(chunk)
-                except Exception as exc:  # pragma: no cover - real-time playback
-                    logger.warning("Speaker write failed: %s", exc)
+                    generation, chunk = self._queue.get_nowait()
+                except queue.Empty:
+                    break  # underrun: the rest of the buffer stays silent
+                if generation != self._generation or not self._active:
+                    continue
+                self._pending = chunk
+            take = min(need - pos, len(self._pending))
+            outdata[pos : pos + take] = self._pending[:take]
+            self._pending = self._pending[take:]
+            pos += take
+
+        if pos < need:
+            outdata[pos:need] = b"\x00" * (need - pos)
 
     def _update_level(self, chunk: bytes) -> None:
         if not chunk:

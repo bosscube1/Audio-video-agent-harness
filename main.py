@@ -1,9 +1,10 @@
 """Entry point for the Gemini Live Agent.
 
 Usage:
-    python main.py                              # Text + voice (default)
-    python main.py --mode text                  # Text-only
-    python main.py --mode voice --voice Kore    # Voice-only with Kore
+    python main.py                              # GUI (default)
+    python main.py --headless                   # Terminal mode (text + voice)
+    python main.py --headless --mode text       # Terminal, text-only
+    python main.py --mode voice --voice Kore    # GUI, voice-only with Kore
     python main.py --yolo                       # Skip safety confirmations
     python main.py --working-dir C:\\Projects    # Set working directory
 """
@@ -86,8 +87,8 @@ Examples:
     parser.add_argument(
         "--headless",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run in headless terminal mode (default: True)",
+        default=False,
+        help="Run in headless terminal mode instead of the GUI (default: False)",
     )
     parser.add_argument(
         "--debug",

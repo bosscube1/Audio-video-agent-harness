@@ -34,17 +34,18 @@
 cd C:\Users\Hp\projects\gemini-live-agent
 .venv\Scripts\python -m gemini_live_agent --help
 
-# Text mode
-.venv\Scripts\python -m gemini_live_agent --mode text
+# GUI (default)
+.venv\Scripts\python -m gemini_live_agent
 
-# Voice mode
-.venv\Scripts\python -m gemini_live_agent --mode voice
+# Terminal modes
+.venv\Scripts\python -m gemini_live_agent --headless --mode text
+.venv\Scripts\python -m gemini_live_agent --headless --mode voice
 
 # With screen share
 .venv\Scripts\python -m gemini_live_agent --mode both --share-screen
 ```
 
-The first run migrates `GOOGLE_API_KEY` from `.env` into the Windows Credential Manager. If no key exists, it prompts for one.
+The first run migrates `GOOGLE_API_KEY` from `.env` into the Windows Credential Manager. If no key exists, it prompts for one. Installed shortcuts launch the GUI (`--no-headless`); a "terminal" shortcut is also installed.
 
 ## What's working
 
