@@ -418,20 +418,43 @@ class LiveSession:
 
                     usage = response.usage_metadata
                     if usage:
-                        await self._emit(
-                            UsageUpdate(
-                                prompt_tokens=getattr(usage, "prompt_token_count", 0),
-                                cached_tokens=getattr(
-                                    usage, "cached_content_token_count", 0
-                                ),
-                                completion_tokens=getattr(
-                                    usage, "completion_token_count", 0
-                                ),
-                                audio_tokens=getattr(usage, "audio_token_count", 0),
-                                video_tokens=getattr(usage, "video_token_count", 0),
-                                total_tokens=getattr(usage, "total_token_count", 0),
+                        # genai >= 2.x: output tokens are ``response_token_count``
+                        # and per-modality counts live in the *_tokens_details
+                        # lists. Older field names (completion/audio/video)
+                        # silently miss, so read the real ones.
+                        def _modality_tokens(details: Any, name: str) -> int:
+                            return sum(
+                                getattr(d, "token_count", 0) or 0
+                                for d in (details or [])
+                                if str(getattr(d, "modality", "")).upper() == name
                             )
+
+                        prompt_details = getattr(usage, "prompt_tokens_details", None)
+                        response_details = getattr(
+                            usage, "response_tokens_details", None
                         )
+                        audio_tokens = _modality_tokens(
+                            prompt_details, "AUDIO"
+                        ) + _modality_tokens(response_details, "AUDIO")
+                        video_tokens = _modality_tokens(
+                            prompt_details, "VIDEO"
+                        ) + _modality_tokens(response_details, "VIDEO")
+                        usage_event = UsageUpdate(
+                            prompt_tokens=getattr(usage, "prompt_token_count", 0) or 0,
+                            cached_tokens=getattr(
+                                usage, "cached_content_token_count", 0
+                            )
+                            or 0,
+                            completion_tokens=getattr(
+                                usage, "response_token_count", 0
+                            )
+                            or 0,
+                            audio_tokens=audio_tokens,
+                            video_tokens=video_tokens,
+                            total_tokens=getattr(usage, "total_token_count", 0) or 0,
+                        )
+                        await self._emit(usage_event)
+                        self._record_usage(usage_event)
 
         except asyncio.CancelledError:
             return None
@@ -687,6 +710,22 @@ class LiveSession:
 
     async def _emit(self, event: Any) -> None:
         await self._event_queue.put(event)
+
+    def _record_usage(self, event: UsageUpdate) -> None:
+        """Persist non-zero usage modalities as incremental history rows."""
+        recorded_at = datetime.now(UTC).isoformat()
+        modalities = {
+            "prompt": event.prompt_tokens,
+            "cached": event.cached_tokens,
+            "completion": event.completion_tokens,
+            "audio": event.audio_tokens,
+            "video": event.video_tokens,
+        }
+        for modality, tokens in modalities.items():
+            if tokens:
+                self._store.record_usage(
+                    self._run_id, modality, tokens, event.estimated_usd, recorded_at
+                )
 
     async def _stop_media(self) -> None:
         """Stop microphone, speaker, and screen capture if the session owns them."""

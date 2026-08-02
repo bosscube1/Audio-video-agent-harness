@@ -120,6 +120,13 @@ class Supervisor:
         """Run the main reconnect loop until the user disconnects or we fail."""
         self._resumption_handle = self._store.get_active_resumption_handle(self._run_id)
         self._dispatcher.set_respond_callback(self._respond_to_model)
+        self._store.start_run(
+            self._run_id,
+            datetime.now(UTC).isoformat(),
+            self._settings.model,
+            self._settings.mode,
+            str(self._settings.workspace_root),
+        )
 
         meter_task: asyncio.Task[Any] | None = None
         try:
@@ -199,6 +206,7 @@ class Supervisor:
                 self._epoch += 1
         finally:
             self._live_session = None
+            self._store.end_run(self._run_id)
             await self._emit(ConnectionStateChanged(ConnectionState.DISCONNECTED))
             if meter_task is not None:
                 meter_task.cancel()

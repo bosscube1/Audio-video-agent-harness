@@ -550,3 +550,61 @@ async def test_failure_budget_returns_failed(
         isinstance(e, ConnectionStateChanged) and e.state == ConnectionState.FAILED
         for e in await drain(event_queue)
     )
+
+
+@pytest.mark.asyncio
+async def test_run_lifecycle_turns_and_usage_persisted(
+    settings: AppSettings,
+    command_queue: asyncio.Queue[Any],
+    event_queue: asyncio.Queue[Any],
+    journal: Journal,
+    store: Store,
+    monkeypatch: Any,
+) -> None:
+    """Phase 6: runs, turns, and usage land in SQLite incrementally."""
+    live = FakeLive()
+
+    async def on_connect(session: FakeLiveSession) -> None:
+        session.say("persisted turn", turn_complete=True)
+        session.usage(
+            prompt_token_count=100,
+            response_token_count=20,
+            total_token_count=120,
+        )
+
+    live.on_connect(on_connect)
+    _patch_for_supervisor(monkeypatch, live)
+
+    supervisor = Supervisor(
+        settings=settings,
+        command_queue=command_queue,
+        event_queue=event_queue,
+        journal=journal,
+        store=store,
+        run_id="persist-run",
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    events: list[Any] = []
+    await _wait_for_event(
+        event_queue,
+        events,
+        lambda e: isinstance(e, TurnComplete) and "persisted turn" in e.text,
+    )
+    await asyncio.sleep(0.05)  # let the usage row flush
+    await command_queue.put(Disconnect())
+    reason = await asyncio.wait_for(task, timeout=5)
+    assert reason.code == "user_request"
+
+    run = store.get_run("persist-run")
+    assert run is not None
+    assert run["model"] == "gemini-3.1-flash-live-preview"
+    assert run["ended_at"] is not None
+
+    turns = store.get_turns("persist-run")
+    assert any("persisted turn" in text for _role, text, _epoch in turns)
+
+    usage = store.get_usage("persist-run")
+    by_modality = {modality: tokens for modality, tokens, _usd, _at in usage}
+    assert by_modality.get("prompt") == 100
+    assert by_modality.get("completion") == 20

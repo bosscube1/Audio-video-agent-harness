@@ -146,11 +146,11 @@ class Store:
         mode: str,
         workspace_root: str,
     ) -> None:
-        """Insert a new run record."""
+        """Insert a new run record (idempotent for a repeated run_id)."""
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO runs (id, started_at, model, mode, workspace_root)
+                INSERT OR IGNORE INTO runs (id, started_at, model, mode, workspace_root)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (run_id, started_at, model, mode, workspace_root),
@@ -237,6 +237,29 @@ class Store:
                 """,
                 (run_id, modality, tokens, usd, recorded_at),
             )
+
+    def get_usage(self, run_id: str) -> list[tuple[str, int, float, str]]:
+        """Return usage rows for a run ordered by recording time."""
+        rows = self._conn.execute(
+            """
+            SELECT modality, tokens, usd, recorded_at
+            FROM usage
+            WHERE run_id = ?
+            ORDER BY recorded_at ASC
+            """,
+            (run_id,),
+        ).fetchall()
+        return [
+            (row["modality"], row["tokens"], row["usd"], row["recorded_at"])
+            for row in rows
+        ]
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return the run record as a dict, or ``None`` if it does not exist."""
+        row = self._conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def save_resumption_handle(
         self,

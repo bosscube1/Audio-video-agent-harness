@@ -34,4 +34,19 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = [".", "gemini_live_agent"]
+# Flat-layout project: ship every runtime package plus the two top-level
+# entry modules that `gemini_live_agent._entry` imports lazily.
+include = [
+    "app",
+    "audit",
+    "core",
+    "gemini_live_agent",
+    "media",
+    "obs",
+    "persist",
+    "policy",
+    "settings",
+    "tools",
+    "headless.py",
+    "main.py",
+]

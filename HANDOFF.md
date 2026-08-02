@@ -6,8 +6,17 @@
 - **Remote:** `https://github.com/bosscube1/Audio-video-agent-harness.git`
 - **Branch:** `Kimi-V2`
 - **Latest commit:** *(update after next commit)* — Phase 5 GUI control surfaces & voice UX
-- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption / barge-in), 4 (GUI shell on a QThread), 5 (GUI control surfaces + voice UX polish)
-- **Phase ready to start:** 6 (persistence, packaging, hardening)
+- **Phases complete:** 1 (foundation), 2 (headless core extraction), 3 (session lifetime / resumption / barge-in), 4 (GUI shell on a QThread), 5 (GUI control surfaces + voice UX polish), 6 (persistence wiring + packaging)
+- **Next:** manual Phase 6 gate with real hardware (see below), then cut-list candidates
+
+## Phase 6 additions
+
+- **Wheel fixed.** `pyproject.toml` hatch target replaced `packages = [".", ...]` with an explicit `include` list; verified `python -m build` produces a wheel whose install imports every package cleanly.
+- **Run lifecycle persisted.** `Supervisor.run()` calls `store.start_run()` / `end_run()`; `start_run` is now idempotent (`INSERT OR IGNORE`).
+- **Usage persisted.** `LiveSession` records per-modality usage rows. **Bug fix:** genai 2.x `UsageMetadata` has no `completion_token_count` / `audio_token_count` / `video_token_count` — completion now reads `response_token_count`, audio/video come from `prompt_tokens_details` / `response_tokens_details`. These were previously always 0.
+- **New accessors:** `Store.get_usage(run_id)`, `Store.get_run(run_id)`.
+- **PyInstaller onedir build.** `packaging/gemini-live-agent.spec` (+ generated `icon.ico`, `version.txt`). Hidden imports for `mss` and `_sounddevice_data` PortAudio DLLs; heavy PySide6 modules excluded. Console kept on so `--headless` works.
+- **Smoke test passing:** `dist/gemini-live-agent/gemini-live-agent.exe --help` exits 0 from a clean directory; bundle is 153 MB.
 
 ## Phase 5 additions (GUI)
 
@@ -68,41 +77,37 @@ The first run migrates `GOOGLE_API_KEY` from `.env` into the Windows Credential 
 - **Tool results are delivered across reconnects.** If the original `fc_id` is rejected, the result is reinjected as a system-note client turn.
 - **GoAway causes a hard reconnect, not overlapped.** Media stays alive; the old socket is closed and a new one is opened with the saved handle.
 
-## Immediate next: Phase 6 — persistence, packaging, hardening
+## Immediate next: manual Phase 6 gate + Inno Setup
 
-Phases 4 and 5 are done: the GUI shell runs on a QThread bridge and now has
-control surfaces (usage panel, activity feed, approval cards) plus voice UX
-(mic state machine, tray, share indicator, keyboard mnemonics).
+Phase 6 code work is done (wheel fixed, run/turn/usage persistence wired,
+PyInstaller onedir build passing its smoke test). What remains needs real
+hardware and the real API:
 
-### Phase 6 scope (from Context.txt)
+### Manual Phase 6 gate
 
-- **Incremental SQLite history** written as turns complete (`persist/store.py`
-  already has the schema).
-- **Wheel check first.** `pyproject.toml` has `packages = [".", "gemini_live_agent"]`;
-  run `python -m build` and inspect the wheel to confirm `app/`, `core/`,
-  `media/`, `tools/`, `policy/`, `audit/`, `obs/`, `persist/`, `settings/` all
-  land in it. Fix the target layout before touching PyInstaller.
-- **PyInstaller spec.** Hidden imports for `sounddevice`'s `_sounddevice_data`
-  DLL and `mss`; aggressively exclude PySide6 plugins (QtWebEngine, Qt3D,
-  QtCharts, QtQuick, QtMultimedia, translations) or the exe exceeds 300 MB.
-  Prefer **onedir + Inno Setup** over `--onefile` (3-8 s cold start per launch
-  otherwise). Version resource + icon.
-- **Phase 6 gate:** built exe launches on a clean path with no `.env` and no
-  source tree, prompts for the API key, completes a voice turn, and writes
-  state under `%LOCALAPPDATA%`.
+- Built exe launches on a clean path with no `.env` and no source tree,
+  prompts for the API key, completes a voice turn, and writes state under
+  `%LOCALAPPDATA%`.
+- Rebuild command: `.venv\Scripts\pyinstaller packaging\gemini-live-agent.spec --clean --noconfirm`
 
-### Remaining Phase 5 verification (manual, needs real hardware/session)
+### Inno Setup installer
 
-- 20-minute streaming session while dragging the window and opening a native
-  file dialog — zero audio dropouts.
-- Full approve/deny cycle by keyboard only (mnemonics are in place).
-- Screen reader announces transcript rows and approval buttons.
+Wrap `dist\gemini-live-agent\` in an Inno Setup script (not started). Context.txt
+prefers onedir + installer over `--onefile` for daily-launch cold-start times.
+
+### Live wall tests still pending
+
+- **Phase 3 gate:** 30-minute real session with `--share-screen`, crossing the
+  ~10-minute connection wall repeatedly, recording reconnect count and gaps.
+- **Phase 5 gate:** 20-minute streaming session while dragging the window and
+  opening a native file dialog — zero audio dropouts; keyboard-only
+  approve/deny; screen-reader pass.
 
 ### Risks / known issues
 
 - **Old `scratch/` directory** at `C:\Users\Hp\.gemini\antigravity\scratch\gemini-live-agent` still exists. Remove it manually if still locked.
 - **`.env` file still exists** in the repo root. It is ignored by git, but `settings.secrets.migrate_dotenv()` already moved the key into the credential store. Decide whether to delete the file or keep it as a dev-only convenience.
-- **Directory/package name still has a hyphen.** `python -m gemini_live_agent` works because of the `gemini_live_agent/` package, but a proper layout will be needed before PyInstaller packaging.
+- **Directory/package name still has a hyphen.** No longer blocking: the flat layout builds fine under PyInstaller (Phase 6 smoke test passed). Only relevant if the project ever moves to a `src/` layout.
 - **Live 30-minute wall test** from the Phase 3 verification gate has not been run yet. Run it before declaring Phase 3 fully validated in production.
 - **`.claude/` worktree cleanup** was attempted: the `claude/adoring-wright-c18ce1` worktree metadata was removed from git, but the empty `.claude/worktrees/adoring-wright-c18ce1` directory could not be deleted because Windows reports it as "Device or resource busy" (likely held by a shell or explorer). Reboot or close the holding process, then delete `.claude/` manually.
 - **Global hotkeys** (system-wide mute/push-to-talk) were not implemented in Phase 5 — no cross-platform hotkey dependency is declared. Revisit after packaging.
