@@ -92,8 +92,16 @@ hardware and the real API:
 
 ### Inno Setup installer
 
-Wrap `dist\gemini-live-agent\` in an Inno Setup script (not started). Context.txt
-prefers onedir + installer over `--onefile` for daily-launch cold-start times.
+`packaging/installer.iss` is drafted (per-machine install under Program Files,
+Start Menu + optional desktop shortcut, post-install launch). To produce the
+installer, install Inno Setup 6 and run:
+
+```
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
+```
+
+Output lands in `dist\installer\gemini-live-agent-setup-0.2.0.exe`. Inno Setup
+is not installed on this machine yet, so the script has not been compile-tested.
 
 ### Live wall tests still pending
 
