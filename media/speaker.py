@@ -26,9 +26,16 @@ class Speaker:
 
     Playback runs on a dedicated writer thread so that ``write()`` never blocks
     the async event loop. A monotonic generation counter protects ``flush()``
-    from races with concurrent ``write()`` calls: after ``flush()`` increments
-    the generation, queued chunks tagged with the old generation are discarded
-    by the writer.
+    from races with queued ``write()`` calls: after ``flush()`` increments the
+    generation, queued chunks tagged with the old generation are discarded by
+    the writer.
+
+    Thread-safety: ``self._lock`` serializes *all* stream access. The writer
+    holds it for the whole check+write, and ``flush()``/``stop()`` hold it for
+    the whole abort/close/recreate, so the native PortAudio stream is never
+    torn down while another thread is inside ``stream.write()`` — closing an
+    MME stream mid-write is a use-after-free that can kill the process without
+    a Python traceback.
     """
 
     def __init__(
@@ -49,7 +56,6 @@ class Speaker:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._generation = 0
-        self._flushing = threading.Event()
 
         self._last_level = 0.0
         self._level_lock = threading.Lock()
@@ -81,15 +87,18 @@ class Speaker:
             self._thread.join(timeout=2)
             self._thread = None
 
-        try:
-            self._stream.stop()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Speaker stop failed: %s", exc)
-        try:
-            self._stream.close()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Speaker close failed: %s", exc)
-        self._stream = None
+        # Take the lock so a write that outlived the join finishes before the
+        # stream is stopped and closed underneath it.
+        with self._lock:
+            try:
+                self._stream.stop()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Speaker stop failed: %s", exc)
+            try:
+                self._stream.close()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Speaker close failed: %s", exc)
+            self._stream = None
         logger.info("[SPK] Speaker stopped")
 
     def write(self, pcm_bytes: bytes) -> None:
@@ -106,31 +115,30 @@ class Speaker:
         """Drop all pending audio immediately, e.g. on barge-in.
 
         Draining the queue alone is not enough to stop the model mid-sentence:
-        PortAudio has already buffered whatever was handed to ``write()``, and
-        the writer thread may be blocked inside a ``stream.write()`` call that
-        only returns at playback speed. We abort the current stream, close it,
-        and open a fresh one for the next turn. On Windows MME, restarting an
-        aborted stream often fails with "media data is still playing", so we
-        always recreate the stream instead.
-        """
-        with self._lock:
-            self._generation += 1
-            stream = self._stream
-            active = self._active
+        PortAudio has already buffered whatever was handed to ``write()``. We
+        abort the current stream, close it, and open a fresh one for the next
+        turn. On Windows MME, restarting an aborted stream often fails with
+        "media data is still playing", so we always recreate the stream
+        instead.
 
+        The whole teardown runs under ``self._lock``, which the writer thread
+        also holds for the duration of its ``stream.write()`` call. An
+        in-flight write therefore finishes before the stream is aborted and
+        closed — tearing the stream down mid-write corrupts the native MME
+        state and can crash the process outright.
+        """
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
 
-        if stream is None or not active:
-            return
+        with self._lock:
+            self._generation += 1
+            stream = self._stream
+            if stream is None or not self._active:
+                return
 
-        # Tell the writer to stand down while the stream is torn down and
-        # rebuilt, so it does not write into a stopped stream.
-        self._flushing.set()
-        try:
             with contextlib.suppress(Exception):
                 stream.abort()
             with contextlib.suppress(Exception):
@@ -148,8 +156,6 @@ class Speaker:
             except Exception as exc:  # pragma: no cover - device dependent
                 logger.warning("Speaker stream recreate after flush failed: %s", exc)
                 self._stream = None
-        finally:
-            self._flushing.clear()
 
         with self._level_lock:
             self._last_level = 0.0
@@ -175,19 +181,19 @@ class Speaker:
                 return
 
             generation, chunk = item
+            # Hold the lock for the whole check+write so flush()/stop() cannot
+            # tear the stream down mid-write.
             with self._lock:
-                current_generation = self._generation
-                active = self._active
-
-            if not active or generation != current_generation:
-                continue
-            if self._stream is None or self._flushing.is_set():
-                continue
-
-            try:
-                self._stream.write(chunk)
-            except Exception as exc:  # pragma: no cover - real-time playback
-                logger.warning("Speaker write failed: %s", exc)
+                if (
+                    not self._active
+                    or generation != self._generation
+                    or self._stream is None
+                ):
+                    continue
+                try:
+                    self._stream.write(chunk)
+                except Exception as exc:  # pragma: no cover - real-time playback
+                    logger.warning("Speaker write failed: %s", exc)
 
     def _update_level(self, chunk: bytes) -> None:
         if not chunk:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -165,7 +166,53 @@ def test_flush_survives_a_stream_that_fails_to_abort() -> None:
     speaker.flush()
 
     assert speaker._queue.qsize() == 0
-    assert not speaker._flushing.is_set()
+    assert speaker._stream is not None  # fresh stream recreated despite the error
+
+
+def test_flush_waits_for_an_in_flight_write() -> None:
+    """flush() must not abort/close the stream while the writer is mid-write.
+
+    Regression test: closing an MME stream during a concurrent write corrupts
+    native PortAudio state and can kill the process without a traceback.
+    """
+    write_started = threading.Event()
+    release_write = threading.Event()
+    order: list[str] = []
+
+    class _SlowStream(_StubStream):
+        def write(self, chunk: bytes) -> None:
+            order.append("write_start")
+            write_started.set()
+            release_write.wait(timeout=5)
+            order.append("write_end")
+
+        def close(self) -> None:
+            order.append("close")
+            super().close()
+
+    stream = _SlowStream()
+    speaker = Speaker(stream_factory=lambda **_kw: _StubStream())
+    speaker._stream = stream
+    speaker._active = True
+    speaker._thread = threading.Thread(target=speaker._writer, daemon=True)
+    speaker._thread.start()
+
+    speaker.write(b"\x01\x00" * 100)
+    assert write_started.wait(timeout=2)
+
+    flush_thread = threading.Thread(target=speaker.flush, daemon=True)
+    flush_thread.start()
+    # Give flush() every chance to race ahead; it must stay blocked.
+    flush_thread.join(timeout=0.2)
+    assert "close" not in order
+
+    release_write.set()
+    flush_thread.join(timeout=5)
+    assert order.index("close") > order.index("write_end")
+
+    speaker._active = False
+    speaker._queue.put(None)
+    speaker._thread.join(timeout=2)
 
 
 # ----------------------------------------------------------------------
