@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -256,6 +257,20 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self._tray_check, row, 0, 1, 2)
 
         row += 1
+        self._system_prompt_edit = QPlainTextEdit()
+        self._system_prompt_edit.setPlaceholderText(
+            "Extra instructions for the model (optional). Appended to the "
+            "built-in system prompt; applies on the next connect."
+        )
+        self._system_prompt_edit.setMaximumHeight(72)
+        self._system_prompt_edit.setAccessibleName("Custom system prompt")
+        system_prompt_label = QLabel("System prompt:")
+        settings_layout.addWidget(
+            system_prompt_label, row, 0, Qt.AlignmentFlag.AlignTop
+        )
+        settings_layout.addWidget(self._system_prompt_edit, row, 1)
+
+        row += 1
         self._working_dir_edit = QLineEdit()
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._on_browse_working_dir)
@@ -383,6 +398,7 @@ class MainWindow(QMainWindow):
         self._fps_spin.setValue(self._settings.screen_fps)
         self._yolo_check.setChecked(self._settings.yolo)
         self._tray_check.setChecked(self._settings.minimize_to_tray)
+        self._system_prompt_edit.setPlainText(self._settings.system_prompt)
         self._working_dir_edit.setText(str(self._settings.working_dir))
         if self._settings.input_device:
             self._input_device_combo.setCurrentText(self._settings.input_device)
@@ -406,6 +422,7 @@ class MainWindow(QMainWindow):
             output_device=self._output_device_combo.currentData(),
             yolo=self._yolo_check.isChecked(),
             minimize_to_tray=self._tray_check.isChecked(),
+            system_prompt=self._system_prompt_edit.toPlainText().strip(),
             headless=False,
             debug=self._settings.debug,
         )

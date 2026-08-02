@@ -88,6 +88,8 @@ class AppSettings(BaseSettings):
     headless: bool = True
     debug: bool = False
     minimize_to_tray: bool = True
+    # Extra instructions appended to the built-in system prompt. Empty = default.
+    system_prompt: str = ""
 
     @field_validator("voice")
     @classmethod
@@ -196,6 +198,10 @@ class AppSettings(BaseSettings):
             shell=shell,
             screen_note=_SCREEN_NOTE if self.share_screen else "",
         )
+        if self.system_prompt.strip():
+            instruction_text += (
+                "\n## Additional Instructions\n" + self.system_prompt.strip() + "\n"
+            )
 
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],

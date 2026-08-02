@@ -134,12 +134,12 @@ QPushButton#accentButton:hover {{
 }}
 
 /* -- Inputs --------------------------------------------------------------- */
-QLineEdit, QComboBox, QDoubleSpinBox {{
+QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit {{
     {_panel_qss("rgba(6, 13, 31, 0.55)", 9)}
     padding: 6px 10px;
     selection-background-color: {CYAN_DIM};
 }}
-QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {{
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {{
     border: 1px solid {CYAN_400};
 }}
 QComboBox::drop-down {{ border: none; width: 24px; }}
